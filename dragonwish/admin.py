@@ -3,24 +3,82 @@ from django.core.exceptions import ValidationError
 from django.db.models import Count
 from django.forms import BaseInlineFormSet
 
-from .models import Dragon, DragonBall, Relic
+from .models import ActivationBall, Dragon, DragonBall, DragonSpecial, Relic, RewardBall, WishSettings
 
 
-class DragonBallFormSet(BaseInlineFormSet):
+class UniqueEntriesFormSet(BaseInlineFormSet):
+    """
+    Inline entries pointing to a countryball (or special): no duplicates, with an optional minimum.
+    """
+
+    target = "ball"
+    minimum = 0
+    minimum_message = ""
+
     def clean(self):
         super().clean()
         seen: set[int] = set()
         for form in self.forms:
             if not hasattr(form, "cleaned_data") or form.cleaned_data.get("DELETE"):
                 continue
-            ball = form.cleaned_data.get("ball")
-            if ball is None:
+            entry = form.cleaned_data.get(self.target)
+            if entry is None:
                 continue
-            if ball.pk == self.instance.ball_id:
-                raise ValidationError("The dragon itself cannot also be one of its dragon balls.")
-            if ball.pk in seen:
-                raise ValidationError(f"{ball} is listed more than once.")
-            seen.add(ball.pk)
+            if entry.pk in seen:
+                raise ValidationError(f"{entry} is listed more than once.")
+            seen.add(entry.pk)
+        if len(seen) < self.minimum:
+            raise ValidationError(self.minimum_message)
+        self.clean_entries(form_data=[x.cleaned_data for x in self.forms if self._is_kept(x)])
+
+    @staticmethod
+    def _is_kept(form) -> bool:
+        return hasattr(form, "cleaned_data") and not form.cleaned_data.get("DELETE") and bool(form.cleaned_data)
+
+    def clean_entries(self, form_data: list[dict]):
+        pass
+
+
+class ActivationBallFormSet(UniqueEntriesFormSet):
+    minimum = 1
+    minimum_message = "A wish needs at least one activation countryball."
+
+
+class DragonBallFormSet(UniqueEntriesFormSet):
+    minimum = 1
+    minimum_message = "A wish needs at least one dragon ball."
+
+    def clean_entries(self, form_data: list[dict]):
+        total = len([x for x in form_data if x.get("ball")])
+        required = self.instance.required_count
+        if required and required > total:
+            raise ValidationError(
+                f"The wish requires {required} different dragon balls but only {total} are listed. "
+                "Add more dragon balls or lower the required amount."
+            )
+
+
+class RewardBallFormSet(UniqueEntriesFormSet):
+    pass
+
+
+class SpecialChanceFormSet(UniqueEntriesFormSet):
+    target = "special"
+
+    def clean_entries(self, form_data: list[dict]):
+        total = sum(x.get("chance") or 0 for x in form_data if x.get("special"))
+        if total > 100:
+            raise ValidationError(f"The chances add up to {total:g}%, they cannot exceed 100%.")
+
+
+class ActivationBallInline(admin.TabularInline):
+    model = ActivationBall
+    formset = ActivationBallFormSet
+    extra = 1
+    fields = ("position", "ball", "emoji")
+    autocomplete_fields = ("ball",)
+    verbose_name = "activation countryball"
+    verbose_name_plural = "activation countryballs (any one of them activates the wish)"
 
 
 class DragonBallInline(admin.TabularInline):
@@ -29,35 +87,67 @@ class DragonBallInline(admin.TabularInline):
     extra = 1
     fields = ("position", "ball", "emoji")
     autocomplete_fields = ("ball",)
+    verbose_name = "dragon ball"
+    verbose_name_plural = "dragon balls (the wish needs the amount set in 'Required count', all of them if empty)"
+
+
+class RewardBallInline(admin.TabularInline):
+    model = RewardBall
+    formset = RewardBallFormSet
+    extra = 0
+    fields = ("ball", "weight")
+    autocomplete_fields = ("ball",)
+    verbose_name = "reward countryball"
+    verbose_name_plural = "reward countryballs (leave empty to reward any enabled countryball)"
+
+
+class DragonSpecialInline(admin.TabularInline):
+    model = DragonSpecial
+    formset = SpecialChanceFormSet
+    extra = 0
+    fields = ("position", "special", "chance", "emoji")
+    autocomplete_fields = ("special",)
+    verbose_name = "special chance"
+    verbose_name_plural = "special chances (each rewarded character may get one of these specials)"
 
 
 @admin.register(Dragon)
 class DragonAdmin(admin.ModelAdmin):
     list_display = (
-        "__str__",
+        "name",
         "set_name",
+        "activation_count",
         "ball_count",
+        "required_count",
         "reward_count",
         "relic_count",
-        "shiny_chance",
-        "mythical_chance",
         "position",
         "enabled",
     )
     list_editable = ("position", "enabled")
     list_filter = ("enabled",)
-    list_select_related = ("ball",)
-    search_fields = ("ball__country", "set_name")
-    autocomplete_fields = ("ball",)
-    inlines = (DragonBallInline,)
+    search_fields = ("name", "set_name")
+    inlines = (ActivationBallInline, DragonBallInline, RewardBallInline, DragonSpecialInline)
     fieldsets = (
-        (None, {"fields": ("ball", "enabled", "position")}),
+        (None, {"fields": ("name", "enabled", "position")}),
         ("Display", {"fields": ("emoji", "set_name", "set_emoji")}),
-        ("Rewards", {"fields": ("reward_count", "relic_count", "shiny_chance", "mythical_chance")}),
+        ("Requirements", {"fields": ("required_count",)}),
+        ("Rewards", {"fields": ("reward_count", "relic_count")}),
     )
 
     def get_queryset(self, request):
-        return super().get_queryset(request).annotate(_ball_count=Count("dragon_balls"))
+        return (
+            super()
+            .get_queryset(request)
+            .annotate(
+                _activation_count=Count("activation_balls", distinct=True),
+                _ball_count=Count("dragon_balls", distinct=True),
+            )
+        )
+
+    @admin.display(description="Activation countryballs", ordering="_activation_count")
+    def activation_count(self, obj: Dragon) -> int:
+        return obj._activation_count  # type: ignore
 
     @admin.display(description="Dragon balls", ordering="_ball_count")
     def ball_count(self, obj: Dragon) -> int:
@@ -70,3 +160,21 @@ class RelicAdmin(admin.ModelAdmin):
     list_select_related = ("ball",)
     search_fields = ("ball__country",)
     autocomplete_fields = ("ball",)
+
+
+@admin.register(WishSettings)
+class WishSettingsAdmin(admin.ModelAdmin):
+    list_display = ("__str__", "dragon_name", "dragon_ball_name_plural", "relic_name_plural", "relicborne_name")
+    autocomplete_fields = ("relicborne_special", "craft_pool")
+    fieldsets = (
+        ("Dragons", {"fields": ("dragon_name", "dragon_ball_name", "dragon_ball_name_plural")}),
+        ("Relics", {"fields": ("relic_name", "relic_name_plural", "relicborne_name", "relicborne_special")}),
+        ("Relic crafting", {"fields": ("craft_pool",)}),
+    )
+
+    def has_add_permission(self, request):
+        # there is only one entry, it is created by the migration (or on first use)
+        return not WishSettings.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False

@@ -1,13 +1,20 @@
 # Dragon wish for Ballsdex 3
 
-Gather dragon balls, summon a dragon with `/wish start`, and get rewarded. Everything that used to be hardcoded in
-the v2 package is now configured from the admin panel:
+Gather dragon balls, activate a dragon with `/wish start`, and get rewarded. Everything is configured from the admin
+panel (section "Dragon wish"):
 
-- **Dragons**: the activation dragon (a countryball dropdown), its title, emoji, and what a wish gives (number of
-  characters, number of relics, shiny and mythical chances).
-- **Dragon balls**: added under each dragon with a countryball dropdown, in order, each with an optional emoji.
-  Without an emoji, the emoji of the countryball is used.
-- **Relics**: the countryballs counting as relics, for `/wish craft relics`, `/wish craft relics_2` and as wish rewards.
+- **Wishes**: a name, the emoji and title of the set, how many characters and relics it gives.
+  - **Activation countryballs**: any one of them activates the wish, it is not consumed.
+  - **Dragon balls**: the list of accepted countryballs, each with an optional emoji. Set *Required count* to ask for
+    only some of them (for example 4 for "any 4 different of these 8"), leave it empty to require all of them.
+  - **Reward countryballs**: limit the random rewards to these countryballs, with a relative weight. Leave empty to
+    reward any enabled countryball (except dragon balls).
+  - **Special chances**: any number of specials, each with its percentage. Their catch phrase is shown with the reward.
+- **Relics**: the countryballs counting as relics.
+- **Wish settings**: the words used everywhere (dragon, dragon ball(s), relic(s), relicborne), the special given by
+  relic crafting, and an optional list restricting what relic crafting can give.
+
+Without an emoji, the emoji of the countryball is used.
 
 ## Installation
 
@@ -20,18 +27,16 @@ path = "dragonwish"
 enabled = true
 ```
 
-Rebuild and run the migrations as usual. The first migration creates the tables, the second one fills them with the
-dragons, emojis and relics of the v2 package, looking countryballs up by name (relics by ID 321 to 324). Whatever
-cannot be found is skipped, and the migration does nothing if dragons already exist.
+Rebuild and run the migrations as usual. A new install is filled with the dragons, emojis and relics of the v2 package,
+looking countryballs up by name (relics by ID 321 to 324). Whatever cannot be found is skipped.
 
 Staff members need the `dragonwish` permissions to see the new sections in the admin panel.
 
 ## Things to know
 
-- Specials given as rewards are looked up by name: `Shiny`, `Mythical` and `Relicborne`. They are constants at the
-  top of `dragonwish/wish_ext/cog.py`, as is the player receiving the relics consumed by `/wish craft relics_2`.
-- Shiny and mythical chances are the *overall* chances displayed to players. Shiny is rolled first, so the two cannot
-  add up to more than 100.
-- Newly added dragons and relics can take up to 30 seconds to show up in the command autocompletion.
+- Consumed countryballs (dragon balls, relics) are soft deleted: they stay in the database, flagged as deleted.
+- Chances of specials are overall percentages, tried in order, and cannot add up to more than 100.
+- Command names (`/wish`, `/wish craft relics`...) cannot be renamed from the admin panel, only the words in messages.
+- Newly added wishes and relics can take up to 30 seconds to show up in the command autocompletion.
 - Wishes in progress only live in memory. Restarting the bot loses them, and the locked countryballs unlock by
   themselves after 30 minutes. Reloading the package unlocks them right away.

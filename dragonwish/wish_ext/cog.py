@@ -16,24 +16,15 @@ from ballsdex.core.utils import checks
 from ballsdex.core.utils.menus import ListSource, Menu, TextFormatter
 from ballsdex.core.utils.transformers import BallInstanceTransform, SpecialEnabledTransform, TTLModelTransformer
 from ballsdex.core.utils.utils import inventory_privacy, is_staff
-from bd_models.models import Ball, BallInstance, Player, Special, balls, specials
+from bd_models.models import Ball, BallInstance, Player, balls
 from settings.models import settings
 
-from ..models import Dragon, DragonBall, Relic
+from ..models import ActivationBall, Dragon, DragonBall, DragonSpecial, Relic, RewardBall, WishSettings
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
 
 log = logging.getLogger("ballsdex.packages.wish")
-
-# Names of the specials given as rewards. They must exist in your specials list, otherwise the reward is
-# given without a special (and a warning is logged).
-SHINY_SPECIAL_NAME = "Shiny"
-MYTHICAL_SPECIAL_NAME = "Mythical"
-RELICBORNE_SPECIAL_NAME = "Relicborne"
-
-# `/wish craft relics_2` hands the two consumed relics over to this player instead of deleting them
-RELIC_SINK_DISCORD_ID = 417286033487429633
 
 
 class DragonTransformer(TTLModelTransformer[Dragon]):
@@ -42,13 +33,13 @@ class DragonTransformer(TTLModelTransformer[Dragon]):
     ttl = 30
 
     def key(self, model: Dragon) -> str:
-        return model.ball.country
+        return model.name
 
     def get_queryset(self):
-        return Dragon.objects.filter(enabled=True, **self.filters).select_related("ball")
+        return Dragon.objects.filter(enabled=True, **self.filters)
 
     async def get_from_text(self, value: str) -> Dragon:
-        return await self.get_queryset().aget(ball__country__iexact=value)
+        return await self.get_queryset().aget(name__iexact=value)
 
 
 class RelicTransformer(TTLModelTransformer[Relic]):
@@ -70,10 +61,39 @@ DragonTransform = app_commands.Transform[Dragon, DragonTransformer]
 RelicTransform = app_commands.Transform[Relic, RelicTransformer]
 
 
+@dataclass(frozen=True)
+class Words:
+    """
+    The words configured in the admin panel, used in every message.
+    """
+
+    dragon: str
+    activation: str
+    ball: str
+    balls: str
+    relic: str
+    relics: str
+    relicborne: str
+
+    @classmethod
+    def from_settings(cls, wish_settings: WishSettings) -> "Words":
+        return cls(
+            dragon=wish_settings.dragon_name,
+            activation=f"Activation {wish_settings.dragon_name}",
+            ball=wish_settings.dragon_ball_name,
+            balls=wish_settings.dragon_ball_name_plural,
+            relic=wish_settings.relic_name,
+            relics=wish_settings.relic_name_plural,
+            relicborne=wish_settings.relicborne_name,
+        )
+
+
 class AddResult(enum.Enum):
     ADDED = enum.auto()
     DUPLICATE = enum.auto()
     NOT_NEEDED = enum.auto()
+    ACTIVATION_FULL = enum.auto()
+    BALLS_FULL = enum.auto()
 
 
 @dataclass(eq=False)
@@ -86,21 +106,32 @@ class WishSession:
     interaction: discord.Interaction["BallsDexBot"]
     user: discord.User | discord.Member
     dragon: Dragon
+    words: Words
+    activation_balls: list[ActivationBall]
     dragon_balls: list[DragonBall]
+    special_chances: list[DragonSpecial]
     dragon_instance: BallInstance | None = None
     ball_instances: list[BallInstance] = field(default_factory=list)
+
+    @property
+    def required(self) -> int:
+        """
+        How many different dragon balls are needed.
+        """
+        total = len(self.dragon_balls)
+        return min(self.dragon.required_count, total) if self.dragon.required_count else total
 
     @property
     def all_instances(self) -> list[BallInstance]:
         return ([self.dragon_instance] if self.dragon_instance else []) + self.ball_instances
 
 
-def find_special(name: str) -> Special | None:
-    for special in specials.values():
-        if special.name == name:
-            return special
-    log.warning(f"The special {name!r} does not exist, the reward will be given without it.")
-    return None
+async def soft_delete(instance: BallInstance):
+    """
+    Mark a countryball as deleted. It stays in the database and can be restored.
+    """
+    instance.deleted = True
+    await instance.asave(update_fields=("deleted",))
 
 
 def pick_random_ball(exclude: set[int] | None = None) -> Ball | None:
@@ -114,6 +145,48 @@ def pick_random_ball(exclude: set[int] | None = None) -> Ball | None:
     if sum(weights) <= 0:
         return random.choice(population)
     return random.choices(population, weights)[0]
+
+
+async def pick_reward_ball(dragon: Dragon) -> Ball | None:
+    """
+    Pick the countryball rewarded by a wish: from its reward list if it has one, otherwise any enabled countryball
+    except the dragon balls.
+    """
+    entries = [x async for x in RewardBall.objects.filter(dragon=dragon).select_related("ball")]
+    if entries:
+        return random.choices([x.ball for x in entries], [x.weight for x in entries])[0]
+    excluded = {x async for x in DragonBall.objects.values_list("ball_id", flat=True)}
+    return pick_random_ball(excluded)
+
+
+async def pick_craft_ball(wish_settings: WishSettings) -> Ball | None:
+    """
+    Pick the countryball obtained by crafting relics, from the configured list if there is one.
+    """
+    pool = [x async for x in wish_settings.craft_pool.all()]
+    if pool:
+        return random.choice(pool)
+    return pick_random_ball()
+
+
+def roll_special(chances: list[DragonSpecial]):
+    """
+    Roll which special a rewarded character gets, if any. The chances are overall percentages, tried in order.
+    """
+    roll = random.uniform(0, 100)
+    cumulative = 0.0
+    for entry in chances:
+        cumulative += entry.chance
+        if roll < cumulative:
+            return entry.special
+    return None
+
+
+def catch_phrase_text(special) -> str:
+    """
+    The catch phrase of a special, formatted like in the catch message, to add at the end of a line.
+    """
+    return f"\n*{special.catch_phrase}*" if special and special.catch_phrase else ""
 
 
 def emoji_or_default(bot: "BallsDexBot", custom: str, ball: Ball) -> str:
@@ -162,17 +235,18 @@ def add_chunked_field(embed: discord.Embed, name: str, text: str):
         embed.add_field(name=name if first else "\u200b", value=chunk, inline=False)
 
 
-def reward_lines(dragon: Dragon) -> str:
-    chances = []
-    if dragon.shiny_chance > 0:
-        chances.append(f"✨{dragon.shiny_chance:g}%")
-    if dragon.mythical_chance > 0:
-        chances.append(f"🌌{dragon.mythical_chance:g}%")
-    suffix = f" ( {' | '.join(chances)} )" if chances else ""
+def reward_lines(dragon: Dragon, chances: list[DragonSpecial], words: Words) -> str:
+    parts = []
+    for entry in chances:
+        if entry.chance <= 0:
+            continue
+        label = entry.emoji or entry.special.emoji
+        parts.append(f"{label}{entry.chance:g}%" if label else f"{entry.special.name} {entry.chance:g}%")
+    suffix = f" ( {' | '.join(parts)} )" if parts else ""
     lines = [f"- **Wild Character Drop!{suffix}**"] * dragon.reward_count
     if dragon.relic_count:
         plural = "" if dragon.relic_count == 1 else "s"
-        lines.append(f"- -# **{dragon.relic_count}× Relic Drop{plural}!**")
+        lines.append(f"- -# **{dragon.relic_count}× {words.relic} Drop{plural}!**")
     return "\n".join(lines)
 
 
@@ -236,6 +310,11 @@ class Wish(commands.GroupCog):
             except Exception:
                 log.exception(f"Failed to unlock {instance.pk}")
 
+    @staticmethod
+    async def _words() -> tuple[WishSettings, Words]:
+        wish_settings = await WishSettings.aload()
+        return wish_settings, Words.from_settings(wish_settings)
+
     async def _session_for(self, interaction: discord.Interaction["BallsDexBot"]) -> WishSession | None:
         """
         Fetch the wish of the user, or reply with the reason why there is none usable from this interaction.
@@ -250,15 +329,20 @@ class Wish(commands.GroupCog):
             return None
         return session
 
-    def _try_add(self, session: WishSession, instance: BallInstance) -> AddResult:
-        if instance.ball_id == session.dragon.ball_id:
-            if session.dragon_instance is not None:
+    @staticmethod
+    def _try_add(session: WishSession, instance: BallInstance) -> AddResult:
+        if instance.ball_id in {x.ball_id for x in session.activation_balls}:
+            if session.dragon_instance is None:
+                session.dragon_instance = instance
+                return AddResult.ADDED
+            if session.dragon_instance.ball_id == instance.ball_id:
                 return AddResult.DUPLICATE
-            session.dragon_instance = instance
-            return AddResult.ADDED
+            return AddResult.ACTIVATION_FULL
         if instance.ball_id in {x.ball_id for x in session.dragon_balls}:
             if any(x.ball_id == instance.ball_id for x in session.ball_instances):
                 return AddResult.DUPLICATE
+            if len(session.ball_instances) >= session.required:
+                return AddResult.BALLS_FULL
             session.ball_instances.append(instance)
             return AddResult.ADDED
         return AddResult.NOT_NEEDED
@@ -274,53 +358,105 @@ class Wish(commands.GroupCog):
                 return True
         return False
 
+    @staticmethod
+    def _add_failure(session: WishSession, result: AddResult) -> str:
+        words = session.words
+        match result:
+            case AddResult.DUPLICATE:
+                return "You have already added this!"
+            case AddResult.ACTIVATION_FULL:
+                return f"Your wish already has its {words.activation}."
+            case AddResult.BALLS_FULL:
+                return f"You already added all the {words.balls} needed."
+            case _:
+                return (
+                    "That is not needed for the wish you have chosen!\n"
+                    f"Please make sure to use the correct {words.dragon} and {words.balls} for this wish!"
+                )
+
+    def _wish_emoji(self, session: WishSession) -> str:
+        if session.dragon.emoji:
+            return session.dragon.emoji
+        if session.activation_balls:
+            first = session.activation_balls[0]
+            return emoji_or_default(self.bot, first.emoji, first.ball)
+        return ""
+
     def _set_emoji(self, session: WishSession) -> str:
-        dragon = session.dragon
-        if dragon.set_emoji:
-            return dragon.set_emoji
+        if session.dragon.set_emoji:
+            return session.dragon.set_emoji
         if session.dragon_balls:
             first = session.dragon_balls[0]
             return emoji_or_default(self.bot, first.emoji, first.ball)
         return ""
 
     def _setup_embed(self, session: WishSession) -> discord.Embed:
-        dragon = session.dragon
-        dragon_emoji = emoji_or_default(self.bot, dragon.emoji, dragon.ball)
+        words = session.words
+        total = len(session.dragon_balls)
+        required = session.required
+        activation_emojis = {x.ball_id: emoji_or_default(self.bot, x.emoji, x.ball) for x in session.activation_balls}
         ball_emojis = {x.ball_id: emoji_or_default(self.bot, x.emoji, x.ball) for x in session.dragon_balls}
 
+        if len(session.activation_balls) > 1:
+            activation_need = f"Any one {words.activation} out of the {len(session.activation_balls)} accepted ones"
+        else:
+            activation_need = words.activation
+        if required < total:
+            balls_need = f"Any {required} different {words.balls} out of the {total} accepted ones"
+        else:
+            balls_need = words.balls
+
         embed = discord.Embed(
-            title=f"{settings.collectible_name.title()} Wishing {dragon_emoji} {self._set_emoji(session)}",
+            title=f"{settings.collectible_name.title()} Wishing {self._wish_emoji(session)} {self._set_emoji(session)}",
             description=(
                 "Use `/wish add`, `/wish remove` or `/wish bulk add` to add/remove requirements.\n"
                 "Requires:\n"
-                "- Activation Dragon (Will **__not be deleted__** after the wish)\n"
-                "- Dragon Balls (obtainable from `/hourly`)\n"
-                "Dragon Balls **__will be deleted__** after the wish\n"
+                f"- {activation_need} (Will **__not be deleted__** after the wish)\n"
+                f"- {balls_need} (obtainable from `/hourly`)\n"
+                f"{words.balls} **__will be deleted__** after the wish\n"
                 "Click the tick button when ready.\n-------\n"
                 "Rewards:\n"
-                f"{reward_lines(dragon)}\n"
+                f"{reward_lines(session.dragon, session.special_chances, words)}\n"
             ),
             color=discord.Colour.from_rgb(255, 255, 255),
         )
 
-        dragon_lines = []
+        activation_lines = []
         if session.dragon_instance:
+            emoji = activation_emojis.get(session.dragon_instance.ball_id, "")
             line = session.dragon_instance.short_description(is_trade=True)
-            dragon_lines.append(f"- {dragon_emoji} {line}" if dragon_emoji else f"- {line}")
+            activation_lines.append(f"- {emoji} {line}" if emoji else f"- {line}")
         ball_lines = []
         for instance in session.ball_instances:
-            line = instance.short_description(is_trade=True)
             emoji = ball_emojis.get(instance.ball_id, "")
+            line = instance.short_description(is_trade=True)
             ball_lines.append(f"- {emoji} {line}" if emoji else f"- {line}")
 
-        embed.add_field(name="Activation Dragon:", value=render_deck(dragon_lines, 1), inline=True)
-        embed.add_field(name="Dragon Balls:", value=render_deck(ball_lines, len(session.ball_instances)), inline=True)
+        progress = f" ({len(session.ball_instances)}/{required})" if required < total else ""
+        embed.add_field(name=f"{words.activation}:", value=render_deck(activation_lines, 1), inline=True)
+        embed.add_field(
+            name=f"{words.balls}{progress}:", value=render_deck(ball_lines, len(session.ball_instances)), inline=True
+        )
+
+        # when there is a choice, tell what can be used
+        if len(session.activation_balls) > 1:
+            accepted = "\n".join(
+                f"- {activation_emojis[x.ball_id]} {x.ball.country}".replace("-  ", "- ")
+                for x in session.activation_balls
+            )
+            add_chunked_field(embed, f"Accepted {words.activation}:", accepted)
+        if required < total:
+            accepted = "\n".join(
+                f"- {ball_emojis[x.ball_id]} {x.ball.country}".replace("-  ", "- ") for x in session.dragon_balls
+            )
+            add_chunked_field(embed, f"Accepted {words.balls}:", accepted)
         return embed
 
     @staticmethod
     def _result_embed(
         color: discord.Colour,
         *,
+        words: Words,
         description: str,
         dragon_text: str,
         balls_text: str,
@@ -331,15 +467,16 @@ class Wish(commands.GroupCog):
             title=f"{settings.collectible_name.title()} Wishing", description=description, color=color
         )
         prefix = ":no_entry_sign: " if cancelled else ""
-        embed.add_field(name=f"{prefix}Activation Dragon:", value=dragon_text, inline=True)
-        embed.add_field(name=f"{prefix}Dragon Balls:", value=balls_text, inline=True)
+        embed.add_field(name=f"{prefix}{words.activation}:", value=dragon_text, inline=True)
+        embed.add_field(name=f"{prefix}{words.balls}:", value=balls_text, inline=True)
         if reward_text:
             add_chunked_field(embed, "Reward:", reward_text)
         return embed
 
-    def _cancelled_embed(self) -> discord.Embed:
+    def _cancelled_embed(self, words: Words) -> discord.Embed:
         return self._result_embed(
             discord.Color.red(),
+            words=words,
             description="The wish has been cancelled.",
             dragon_text="Cancelled",
             balls_text="Cancelled",
@@ -371,18 +508,23 @@ class Wish(commands.GroupCog):
                 "You are already wishing. You may use `/wish cancel` to cancel it.", ephemeral=True
             )
             return
+        _, words = await self._words()
+        activation_balls = [x async for x in ActivationBall.objects.filter(dragon=dragon).select_related("ball")]
         dragon_balls = [x async for x in DragonBall.objects.filter(dragon=dragon).select_related("ball")]
-        if not dragon_balls:
+        special_chances = [x async for x in DragonSpecial.objects.filter(dragon=dragon).select_related("special")]
+        if not activation_balls or not dragon_balls:
             await interaction.response.send_message("This wish is not configured yet.", ephemeral=True)
             return
-        # checked again since the query above yielded, a concurrent invocation may have registered a wish
+        # checked again since the queries above yielded, a concurrent invocation may have registered a wish
         if interaction.user.id in self.sessions:
             await interaction.response.send_message(
                 "You are already wishing. You may use `/wish cancel` to cancel it.", ephemeral=True
             )
             return
 
-        session = WishSession(interaction, interaction.user, dragon, dragon_balls)
+        session = WishSession(
+            interaction, interaction.user, dragon, words, activation_balls, dragon_balls, special_chances
+        )
         self.sessions[interaction.user.id] = session
         await interaction.response.send_message(
             embed=self._setup_embed(session), view=WishView(self, interaction.user.id)
@@ -395,7 +537,7 @@ class Wish(commands.GroupCog):
             return
         await interaction.response.defer()
         await self._unlock_all(session.all_instances)
-        await interaction.edit_original_response(embed=self._cancelled_embed(), view=None)
+        await interaction.edit_original_response(embed=self._cancelled_embed(session.words), view=None)
 
     @app_commands.command()
     async def cancel(self, interaction: discord.Interaction["BallsDexBot"]):
@@ -409,7 +551,7 @@ class Wish(commands.GroupCog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self._unlock_all(session.all_instances)
         try:
-            await session.interaction.edit_original_response(embed=self._cancelled_embed(), view=None)
+            await session.interaction.edit_original_response(embed=self._cancelled_embed(session.words), view=None)
         except discord.HTTPException:
             pass
         await interaction.followup.send("Your current wish has been frozen and cancelled.", ephemeral=True)
@@ -420,7 +562,7 @@ class Wish(commands.GroupCog):
         if session is None:
             await interaction.followup.send("This wish doesn't belong to you.", ephemeral=True)
             return
-        if session.dragon_instance is None or len(session.ball_instances) != len(session.dragon_balls):
+        if session.dragon_instance is None or len(session.ball_instances) != session.required:
             await interaction.followup.send("Insufficient Materials!", ephemeral=True)
             return
 
@@ -441,6 +583,7 @@ class Wish(commands.GroupCog):
     async def _grant_wish(self, session: WishSession, instances: list[BallInstance]) -> discord.Embed:
         user = session.user
         dragon = session.dragon
+        words = session.words
         assert session.dragon_instance
 
         # everything must still belong to the user, the locks expire after 30 minutes
@@ -449,60 +592,52 @@ class Wish(commands.GroupCog):
             await self._unlock_all(instances)
             return self._result_embed(
                 discord.Color.dark_orange(),
+                words=words,
                 description=f"Wishing of {user.mention}",
                 dragon_text="Cancelled",
                 balls_text="Cancelled",
-                reward_text="⚠️ One or more Dragon Balls do not belong to you.\nThis wish has been cancelled.",
+                reward_text=f"⚠️ One or more {words.balls} do not belong to you.\nThis wish has been cancelled.",
                 cancelled=True,
             )
 
-        # rendered now, a deleted instance loses its ID
-        dragon_emoji = emoji_or_default(self.bot, dragon.emoji, dragon.ball)
-        dragon_line = session.dragon_instance.short_description(is_trade=True)
-        dragon_text = f"- {dragon_emoji} {dragon_line}" if dragon_emoji else f"- {dragon_line}"
+        # rendered now, a deleted countryball is displayed differently
+        activation = next((x for x in session.activation_balls if x.ball_id == session.dragon_instance.ball_id), None)
+        activation_emoji = emoji_or_default(
+            self.bot,
+            activation.emoji if activation else "",
+            activation.ball if activation else session.dragon_instance.ball,
+        )
+        activation_line = session.dragon_instance.short_description(is_trade=True)
+        dragon_text = f"- {activation_emoji} {activation_line}" if activation_emoji else f"- {activation_line}"
         balls_text = render_deck(
             [f"- ⛔ {x.short_description(is_trade=True)}" for x in session.ball_instances], len(session.ball_instances)
         )
 
         for instance in session.ball_instances:
-            await instance.adelete()
+            await soft_delete(instance)
         await session.dragon_instance.unlock()
 
         player, _ = await Player.objects.aget_or_create(discord_id=user.id)
         reward_text = ""
 
-        # dragon balls cannot be rewarded, but dragons can
-        excluded = {x async for x in DragonBall.objects.values_list("ball_id", flat=True)}
-        shiny = find_special(SHINY_SPECIAL_NAME) if dragon.shiny_chance > 0 else None
-        mythical = find_special(MYTHICAL_SPECIAL_NAME) if dragon.mythical_chance > 0 else None
-        # the mythical roll only happens when the shiny one failed, convert the overall chance
-        mythical_chance = dragon.mythical_chance / (100 - dragon.shiny_chance) * 100 if dragon.shiny_chance < 100 else 0
-
         for _ in range(dragon.reward_count):
-            ball = pick_random_ball(excluded)
+            ball = await pick_reward_ball(dragon)
             if ball is None:
                 log.error("There is no countryball available to give as a wish reward")
                 break
             attack = random.randint(-settings.max_attack_bonus, settings.max_attack_bonus)
             health = random.randint(-settings.max_health_bonus, settings.max_health_bonus)
-            special = None
-            extra = ""
-            if shiny and random.uniform(0, 100) < dragon.shiny_chance:
-                special = shiny
-                extra = f"\n***✨ It's a shiny {settings.collectible_name}! ✨***"
-            elif mythical and random.uniform(0, 100) < mythical_chance:
-                special = mythical
-                extra = f"\n*🔮 This {settings.collectible_name} exudes a mythical aura.🔮*"
+            special = roll_special(session.special_chances)
             await BallInstance.objects.acreate(
                 ball=ball, player=player, special=special, attack_bonus=attack, health_bonus=health
             )
             emoji = emoji_or_default(self.bot, "", ball)
-            reward_text += f"{emoji} {ball.country}\n`{attack:+d}ATK/{health:+d}HP`{extra}\n\n"
+            reward_text += f"{emoji} {ball.country}\n`{attack:+d}ATK/{health:+d}HP`{catch_phrase_text(special)}\n\n"
 
         if dragon.relic_count:
             relics = [x async for x in Relic.objects.select_related("ball")]
             if not relics:
-                log.warning("This dragon gives relics but no relic is configured")
+                log.warning("This wish gives relics but no relic is configured")
             for _ in range(dragon.relic_count if relics else 0):
                 relic = random.choice(relics)
                 await BallInstance.objects.acreate(
@@ -512,6 +647,7 @@ class Wish(commands.GroupCog):
 
         return self._result_embed(
             discord.Color.green(),
+            words=words,
             description=f"Wishing of {user.mention}",
             dragon_text=dragon_text,
             balls_text=balls_text,
@@ -553,15 +689,8 @@ class Wish(commands.GroupCog):
             return
 
         result = self._try_add(session, countryball)
-        if result is AddResult.NOT_NEEDED:
-            await interaction.response.send_message(
-                "That is not needed for the wish you have chosen!\n"
-                "Please make sure to use the correct Dragon and Dragon Balls for this wish!",
-                ephemeral=True,
-            )
-            return
-        if result is AddResult.DUPLICATE:
-            await interaction.response.send_message("You have already added this!", ephemeral=True)
+        if result is not AddResult.ADDED:
+            await interaction.response.send_message(self._add_failure(session, result), ephemeral=True)
             return
 
         await countryball.lock_for_trade()
@@ -609,11 +738,13 @@ class Wish(commands.GroupCog):
         session = await self._session_for(interaction)
         if session is None:
             return
+        words = session.words
 
-        wanted = [x.ball_id for x in session.dragon_balls] + [session.dragon.ball_id]
+        activation_ids = [x.ball_id for x in session.activation_balls]
+        ball_ids = [x.ball_id for x in session.dragon_balls]
         candidates: dict[int, BallInstance] = {}
         async for instance in BallInstance.objects.filter(
-            player__discord_id=interaction.user.id, ball_id__in=wanted
+            player__discord_id=interaction.user.id, ball_id__in=activation_ids + ball_ids
         ).order_by("pk"):
             if instance.ball_id in candidates or not instance.is_tradeable:
                 continue
@@ -622,25 +753,31 @@ class Wish(commands.GroupCog):
                 continue
             candidates[instance.ball_id] = instance
 
-        number_added = 0
         dragon_added = False
-        for ball_id in wanted:
+        if session.dragon_instance is None:
+            for ball_id in activation_ids:
+                instance = candidates.get(ball_id)
+                if instance is not None and self._try_add(session, instance) is AddResult.ADDED:
+                    await instance.lock_for_trade()
+                    dragon_added = True
+                    break
+
+        number_added = 0
+        for ball_id in ball_ids:
+            if len(session.ball_instances) >= session.required:
+                break
             instance = candidates.get(ball_id)
-            if instance is None or self._try_add(session, instance) is not AddResult.ADDED:
-                continue
-            await instance.lock_for_trade()
-            if ball_id == session.dragon.ball_id:
-                dragon_added = True
-            else:
+            if instance is not None and self._try_add(session, instance) is AddResult.ADDED:
+                await instance.lock_for_trade()
                 number_added += 1
 
         if dragon_added:
             if number_added > 0:
-                text = f"Bulk added {number_added} Dragon balls + Activation dragon."
+                text = f"Bulk added {number_added} {words.balls} + {words.activation}."
             else:
-                text = "Added Activation dragon."
+                text = f"Added {words.activation}."
         elif number_added > 0:
-            text = f"Bulk added {number_added} Dragon balls"
+            text = f"Bulk added {number_added} {words.balls}"
         else:
             text = "There is nothing else to add!"
         await interaction.followup.send(text, ephemeral=True)
@@ -684,17 +821,20 @@ class Wish(commands.GroupCog):
             if await inventory_privacy(self.bot, interaction, player, user_obj) is False:
                 return
 
+        _, words = await self._words()
         dragons = [
             x
-            async for x in Dragon.objects.filter(enabled=True)
-            .select_related("ball")
-            .prefetch_related("dragon_balls__ball")
+            async for x in Dragon.objects.filter(enabled=True).prefetch_related(
+                "activation_balls__ball", "dragon_balls__ball"
+            )
         ]
         if not dragons:
-            await interaction.followup.send("No dragon is configured yet.", ephemeral=True)
+            await interaction.followup.send("No wish is configured yet.", ephemeral=True)
             return
 
-        all_ids = {x.ball_id for x in dragons} | {y.ball_id for x in dragons for y in x.dragon_balls.all()}
+        all_ids = {
+            x.ball_id for dragon in dragons for x in [*dragon.activation_balls.all(), *dragon.dragon_balls.all()]
+        }
         owned = {
             x
             async for x in BallInstance.objects.filter(player__discord_id=user_obj.id, ball_id__in=all_ids)
@@ -702,21 +842,29 @@ class Wish(commands.GroupCog):
             .values_list("ball_id", flat=True)
         }
 
+        def line(ball_id: int, emoji: str, label: str) -> str:
+            mark = ":white_check_mark:" if ball_id in owned else ":x:"
+            return f"- {mark}{emoji}{label}"
+
         sections = []
         for dragon in dragons:
-            title = dragon.set_name or f"{dragon.ball.country} Dragon Balls"
+            title = dragon.set_name or f"{dragon.name} {words.balls}"
+            activation_balls = list(dragon.activation_balls.all())
+            dragon_balls = list(dragon.dragon_balls.all())
+            required = min(dragon.required_count, len(dragon_balls)) if dragon.required_count else len(dragon_balls)
 
-            def line(ball_id: int, emoji: str, label: str) -> str:
-                mark = ":white_check_mark:" if ball_id in owned else ":x:"
-                return f"- {mark}{emoji}{label}"
-
-            lines = [line(dragon.ball_id, emoji_or_default(self.bot, dragon.emoji, dragon.ball), dragon.ball.country)]
-            for index, dragon_ball in enumerate(dragon.dragon_balls.all(), start=1):
+            lines = []
+            if required < len(dragon_balls):
+                lines.append(f"-# Any {required} different out of these {len(dragon_balls)}")
+            for activation in activation_balls:
+                emoji = emoji_or_default(self.bot, activation.emoji, activation.ball)
+                lines.append(line(activation.ball_id, emoji, activation.ball.country))
+            for index, dragon_ball in enumerate(dragon_balls, start=1):
                 emoji = emoji_or_default(self.bot, dragon_ball.emoji, dragon_ball.ball)
                 lines.append(line(dragon_ball.ball_id, emoji, f"#{index}"))
             sections.append(f"**{title}:**\n" + "\n".join(lines))
 
-        # two dragons per page
+        # two wishes per page
         pages = ["\n\n".join(sections[i : i + 2]) for i in range(0, len(sections), 2)]
 
         view = LayoutView()
@@ -724,8 +872,8 @@ class Wish(commands.GroupCog):
         container.add_item(
             Section(
                 TextDisplay(
-                    f"**Dragon Ball completion of {user_obj.mention}**\n"
-                    "-# Dragon Balls are obtainable from `/hourly`.\n"
+                    f"**{words.ball} completion of {user_obj.mention}**\n"
+                    f"-# {words.balls} are obtainable from `/hourly`.\n"
                     "-# Use `/dbz completion` for the full dex completion."
                 ),
                 accessory=Thumbnail(user_obj.display_avatar.url),
@@ -755,18 +903,18 @@ class Wish(commands.GroupCog):
         }
 
     def _relic_embed(
-        self, user: discord.User | discord.Member, relics: list[Relic], counts: dict[int, int]
+        self, user: discord.User | discord.Member, relics: list[Relic], counts: dict[int, int], words: Words
     ) -> discord.Embed:
         embed = discord.Embed(
-            title="Relic Crafting",
+            title=f"{words.relic} Crafting",
             description=(
-                f"Craft the {len(relics)} relics to receive a random 🌠Relicborne character!\n"
-                "Relics are obtainable from `/wish start` or `/daily`."
+                f"Craft the {len(relics)} {words.relics.lower()} to receive a random 🌠{words.relicborne} character!\n"
+                f"{words.relics} are obtainable from `/wish start` or `/daily`."
             ),
             color=discord.Colour.from_rgb(82, 92, 145),
         )
         embed.set_author(name=user.name, icon_url=user.display_avatar.url)
-        embed.set_footer(text="Incomplete relic set? Use `/wish craft relics_2`.")
+        embed.set_footer(text=f"Incomplete {words.relic.lower()} set? Use `/wish craft relics_2`.")
         for relic in relics:
             embed.add_field(
                 name=f"{emoji_or_default(self.bot, '', relic.ball)} {relic.ball.country}",
@@ -782,14 +930,15 @@ class Wish(commands.GroupCog):
         Craft the relics!
         """
         await interaction.response.defer(thinking=True)
+        _, words = await self._words()
         relics = [x async for x in Relic.objects.select_related("ball")]
         if not relics:
-            await interaction.followup.send("No relic is configured yet.", ephemeral=True)
+            await interaction.followup.send(f"No {words.relic.lower()} is configured yet.", ephemeral=True)
             return
         counts = await self._relic_counts(interaction.user.id, relics)
         view = RelicCraftView(self, interaction.user.id)
         view.original_message = await interaction.followup.send(
-            embed=self._relic_embed(interaction.user, relics, counts), view=view, wait=True
+            embed=self._relic_embed(interaction.user, relics, counts, words), view=view, wait=True
         )
 
     async def craft_relics(self, interaction: discord.Interaction["BallsDexBot"]):
@@ -797,10 +946,12 @@ class Wish(commands.GroupCog):
         if user.id in self.crafting:
             await interaction.response.send_message("You are already crafting!", ephemeral=True)
             return
+        wish_settings, words = await self._words()
+        not_enough = f"You don't have enough {words.relics.lower()} to craft!"
         relics = [x async for x in Relic.objects.select_related("ball")]
         counts = await self._relic_counts(user.id, relics)
         if not relics or any(counts.get(x.ball_id, 0) < 1 for x in relics):
-            await interaction.response.send_message("You don't have enough relics to craft!", ephemeral=True)
+            await interaction.response.send_message(not_enough, ephemeral=True)
             return
 
         self.crafting.add(user.id)
@@ -817,33 +968,33 @@ class Wish(commands.GroupCog):
                     .afirst()
                 )
                 if instance is None:
-                    await interaction.followup.send("You don't have enough relics to craft!", ephemeral=True)
+                    await interaction.followup.send(not_enough, ephemeral=True)
                     await interaction.edit_original_response(view=RelicCraftView(self, user.id))
                     return
                 consumed.append(instance)
-            for instance in consumed:
-                await instance.adelete()
-            counts = {x.ball_id: counts.get(x.ball_id, 1) - 1 for x in relics}
 
-            ball = pick_random_ball()
+            ball = await pick_craft_ball(wish_settings)
             if ball is None:
                 await interaction.followup.send("There is no countryball available to craft.", ephemeral=True)
+                await interaction.edit_original_response(view=RelicCraftView(self, user.id))
                 return
+            for instance in consumed:
+                await soft_delete(instance)
+            counts = {x.ball_id: counts.get(x.ball_id, 1) - 1 for x in relics}
+
             attack = random.randint(-settings.max_attack_bonus, settings.max_attack_bonus)
             health = random.randint(-settings.max_health_bonus, settings.max_health_bonus)
             player, _ = await Player.objects.aget_or_create(discord_id=user.id)
+            special = wish_settings.relicborne_special
             await BallInstance.objects.acreate(
-                ball=ball,
-                player=player,
-                special=find_special(RELICBORNE_SPECIAL_NAME),
-                attack_bonus=attack,
-                health_bonus=health,
+                ball=ball, player=player, special=special, attack_bonus=attack, health_bonus=health
             )
-            await interaction.followup.send(
-                f"{user.mention} You crafted **{ball.country}**! `({attack:+d}ATK/{health:+d}HP)`\n\n"
-                "***🌠 It's a Relicborne character! 🌠***"
-            )
-            await interaction.edit_original_response(embed=self._relic_embed(user, relics, counts))
+            text = f"{user.mention} You crafted **{ball.country}**! `({attack:+d}ATK/{health:+d}HP)`"
+            if special:
+                phrase = special.catch_phrase or f"It's a {words.relicborne} character!"
+                text += f"\n\n***🌠 {phrase} 🌠***"
+            await interaction.followup.send(text)
+            await interaction.edit_original_response(embed=self._relic_embed(user, relics, counts, words))
 
             await asyncio.sleep(5)
             new_view = RelicCraftView(self, user.id)
@@ -874,34 +1025,35 @@ class Wish(commands.GroupCog):
             The relic you want to create from the fusion.
         """
         await interaction.response.defer(thinking=True, ephemeral=True)
+        _, words = await self._words()
+        relic_word = words.relic.lower()
         relic_ids = {x async for x in Relic.objects.values_list("ball_id", flat=True)}
         if owned_relic1.ball_id not in relic_ids or owned_relic2.ball_id not in relic_ids:
-            await interaction.followup.send("You must select valid relics!", ephemeral=True)
+            await interaction.followup.send(f"You must select valid {words.relics.lower()}!", ephemeral=True)
             return
         if owned_relic1.pk == owned_relic2.pk:
             await interaction.followup.send(
-                "You cannot select relic with the same (Character #ID) twice.", ephemeral=True
+                f"You cannot select {relic_word} with the same (Character #ID) twice.", ephemeral=True
             )
             return
         if chosen_relic.ball_id in (owned_relic1.ball_id, owned_relic2.ball_id):
             await interaction.followup.send(
-                "The chosen relic must be different from the relics you are using!", ephemeral=True
+                f"The chosen {relic_word} must be different from the {words.relics.lower()} you are using!",
+                ephemeral=True,
             )
             return
 
-        sink, _ = await Player.objects.aget_or_create(discord_id=RELIC_SINK_DISCORD_ID)
         player, _ = await Player.objects.aget_or_create(discord_id=interaction.user.id)
+        # described now, a deleted countryball is displayed differently
+        first = owned_relic1.description(short=True, include_emoji=False, bot=self.bot)
+        second = owned_relic2.description(short=True, include_emoji=False, bot=self.bot)
         for relic in (owned_relic1, owned_relic2):
-            relic.player = sink
-            await relic.asave(update_fields=("player",))
+            await soft_delete(relic)
         await BallInstance.objects.acreate(
             ball=chosen_relic.ball, player=player, special=None, attack_bonus=0, health_bonus=0
         )
         await interaction.followup.send(
-            f"You successfully fused {owned_relic1.description(short=True, include_emoji=False, bot=self.bot)} and "
-            f"{owned_relic2.description(short=True, include_emoji=False, bot=self.bot)} "
-            f"to create {chosen_relic.ball.country}!",
-            ephemeral=True,
+            f"You successfully fused {first} and {second} to create {chosen_relic.ball.country}!", ephemeral=True
         )
 
     # ----------------------------------------------------------------------------------------------------------
