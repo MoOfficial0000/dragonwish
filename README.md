@@ -15,7 +15,7 @@ Add the package to your `config/extra.toml` (the `location` is a pip requirement
 
 ```toml
 [[ballsdex.packages]]
-location = "git+https://github.com/<you>/ballsdex-dragonwish.git"
+location = "git+https://github.com/MoOfficial0000/dragonwish.git"
 path = "dragonwish"
 enabled = true
 ```
