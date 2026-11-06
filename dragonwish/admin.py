@@ -3,7 +3,7 @@ from django.core.exceptions import ValidationError
 from django.db.models import Count
 from django.forms import BaseInlineFormSet
 
-from .models import ActivationBall, Dragon, DragonBall, DragonSpecial, Relic, RewardBall, WishSettings
+from .models import ActivationBall, Dragon, DragonBall, DragonSpecial, ExtraRequirement, Relic, RewardBall, WishSettings
 
 
 class UniqueEntriesFormSet(BaseInlineFormSet):
@@ -75,17 +75,33 @@ class ActivationBallInline(admin.TabularInline):
     model = ActivationBall
     formset = ActivationBallFormSet
     extra = 1
-    fields = ("position", "ball", "emoji")
+    fields = ("position", "ball", "emoji_id")
     autocomplete_fields = ("ball",)
     verbose_name = "activation countryball"
     verbose_name_plural = "activation countryballs (any one of them activates the wish)"
+
+
+class ExtraRequirementFormSet(UniqueEntriesFormSet):
+    pass
+
+
+class ExtraRequirementInline(admin.TabularInline):
+    model = ExtraRequirement
+    formset = ExtraRequirementFormSet
+    extra = 0
+    fields = ("position", "name", "ball", "consumed", "emoji_id")
+    autocomplete_fields = ("ball",)
+    verbose_name = "extra required countryball"
+    verbose_name_plural = (
+        "extra required countryballs (each one is required next to the activation countryball and the dragon balls)"
+    )
 
 
 class DragonBallInline(admin.TabularInline):
     model = DragonBall
     formset = DragonBallFormSet
     extra = 1
-    fields = ("position", "ball", "emoji")
+    fields = ("position", "ball", "emoji_id")
     autocomplete_fields = ("ball",)
     verbose_name = "dragon ball"
     verbose_name_plural = "dragon balls (the wish needs the amount set in 'Required count', all of them if empty)"
@@ -105,7 +121,7 @@ class DragonSpecialInline(admin.TabularInline):
     model = DragonSpecial
     formset = SpecialChanceFormSet
     extra = 0
-    fields = ("position", "special", "chance", "emoji")
+    fields = ("position", "special", "chance", "emoji_id")
     autocomplete_fields = ("special",)
     verbose_name = "special chance"
     verbose_name_plural = "special chances (each rewarded character may get one of these specials)"
@@ -127,10 +143,10 @@ class DragonAdmin(admin.ModelAdmin):
     list_editable = ("position", "enabled")
     list_filter = ("enabled",)
     search_fields = ("name", "set_name")
-    inlines = (ActivationBallInline, DragonBallInline, RewardBallInline, DragonSpecialInline)
+    inlines = (ActivationBallInline, ExtraRequirementInline, DragonBallInline, RewardBallInline, DragonSpecialInline)
     fieldsets = (
         (None, {"fields": ("name", "enabled", "position")}),
-        ("Display", {"fields": ("emoji", "set_name", "set_emoji")}),
+        ("Display", {"fields": ("emoji_id", "set_name", "set_emoji_id")}),
         ("Requirements", {"fields": ("required_count",)}),
         ("Rewards", {"fields": ("reward_count", "relic_count")}),
     )
@@ -164,11 +180,13 @@ class RelicAdmin(admin.ModelAdmin):
 
 @admin.register(WishSettings)
 class WishSettingsAdmin(admin.ModelAdmin):
-    list_display = ("__str__", "dragon_name", "dragon_ball_name_plural", "relic_name_plural", "relicborne_name")
+    list_display = ("__str__", "dragon_name", "dragon_ball_name_plural", "relic_name_plural", "completion_layout")
     autocomplete_fields = ("relicborne_special", "craft_pool")
     fieldsets = (
-        ("Dragons", {"fields": ("dragon_name", "dragon_ball_name", "dragon_ball_name_plural")}),
+        ("Dragons", {"fields": ("dragon_name", "dragon_name_plural", "dragon_ball_name", "dragon_ball_name_plural")}),
         ("Relics", {"fields": ("relic_name", "relic_name_plural", "relicborne_name", "relicborne_special")}),
+        ("Messages", {"fields": ("reward_text", "wish_timeout_minutes")}),
+        ("Completion command", {"fields": ("completion_layout",)}),
         ("Relic crafting", {"fields": ("craft_pool",)}),
     )
 

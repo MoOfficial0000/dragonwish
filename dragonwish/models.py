@@ -3,17 +3,31 @@ from django.db import models
 
 from bd_models.models import Ball, Special
 
+EMOJI_HELP = (
+    "ID of the emoji: the number at the end of <:name:ID>, or right click the emoji and choose Copy ID "
+    "(developer mode). Leave empty to use the emoji of the countryball."
+)
+
+
+def emoji_id_field(help_text: str = EMOJI_HELP) -> models.PositiveBigIntegerField:
+    return models.PositiveBigIntegerField(null=True, blank=True, help_text=help_text)
+
 
 class WishSettings(models.Model):
     """
     Words and options shared by every wish. There is only one entry.
     """
 
+    class CompletionLayout(models.TextChoices):
+        BY_DRAGON = "by_dragon", "Each dragon followed by its own dragon balls"
+        BY_BALLS = "by_balls", "All dragons, then all dragon balls by name (a shared dragon ball is listed once)"
+
     dragon_name = models.CharField(
         max_length=32,
         default="Dragon",
         help_text="The word for a dragon. The item that starts a wish is called 'Activation <this word>'.",
     )
+    dragon_name_plural = models.CharField(max_length=32, default="Dragons", help_text="The word for several dragons.")
     dragon_ball_name = models.CharField(max_length=32, default="Dragon Ball", help_text="The word for one dragon ball.")
     dragon_ball_name_plural = models.CharField(
         max_length=32, default="Dragon Balls", help_text="The word for several dragon balls."
@@ -24,6 +38,23 @@ class WishSettings(models.Model):
         max_length=32,
         default="Relicborne",
         help_text="The word for what relic crafting gives, as in 'a Relicborne character'.",
+    )
+    reward_text = models.CharField(
+        max_length=64,
+        default="Wild Character Drop!",
+        help_text="Text of each random character reward, shown in the rewards of a wish.",
+    )
+    wish_timeout_minutes = models.PositiveSmallIntegerField(
+        default=15,
+        validators=[MinValueValidator(1)],
+        help_text="A wish is cancelled after this many minutes without any action (adding, removing, "
+        "pressing a button). Every action resets the timer.",
+    )
+    completion_layout = models.CharField(
+        max_length=16,
+        choices=CompletionLayout,
+        default=CompletionLayout.BY_DRAGON,
+        help_text="How the dragon ball completion command is laid out.",
     )
     relicborne_special = models.ForeignKey(
         Special,
@@ -65,11 +96,9 @@ class Dragon(models.Model):
     name = models.CharField(
         max_length=64, unique=True, help_text="Name of this wish, shown when choosing it in `/wish start`."
     )
-    emoji = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text="Emoji of the wish, shown in its title, for example <:Shenron:1358300433441099948>. "
-        "Leave empty to use the emoji of the first activation countryball.",
+    emoji_id = emoji_id_field(
+        "ID of the emoji of the wish, shown in its title. Leave empty to use the emoji of the first activation "
+        "countryball."
     )
     set_name = models.CharField(
         max_length=64,
@@ -77,11 +106,9 @@ class Dragon(models.Model):
         help_text="Title of this set in the completion command, for example 'Earth Dragon Balls'. "
         "Leave empty to use '<name> <dragon balls word>'.",
     )
-    set_emoji = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text="Emoji of the whole set, shown in the wish title next to the dragon. "
-        "Leave empty to use the emoji of the first dragon ball.",
+    set_emoji_id = emoji_id_field(
+        "ID of the emoji of the whole set, shown in the wish title next to the dragon. Leave empty to use the "
+        "emoji of the first dragon ball."
     )
     required_count = models.PositiveSmallIntegerField(
         null=True,
@@ -111,11 +138,7 @@ class ActivationBall(models.Model):
 
     dragon = models.ForeignKey(Dragon, on_delete=models.CASCADE, related_name="activation_balls")
     ball = models.ForeignKey(Ball, on_delete=models.CASCADE, related_name="+")
-    emoji = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text="Emoji shown for this countryball. Leave empty to use the emoji of the countryball.",
-    )
+    emoji_id = emoji_id_field()
     position = models.PositiveSmallIntegerField(default=0, help_text="Lower values are listed first.")
 
     class Meta:
@@ -128,6 +151,28 @@ class ActivationBall(models.Model):
         return str(self.ball)
 
 
+class ExtraRequirement(models.Model):
+    """
+    An additional countryball a wish requires, next to the activation countryball and the dragon balls.
+    """
+
+    dragon = models.ForeignKey(Dragon, on_delete=models.CASCADE, related_name="extra_requirements")
+    name = models.CharField(max_length=32, help_text="Name shown to players, for example 'Energy Piece'.")
+    ball = models.ForeignKey(Ball, on_delete=models.CASCADE, related_name="+")
+    consumed = models.BooleanField(
+        default=False, help_text="Whether it is deleted by the wish. If not, the player keeps it."
+    )
+    emoji_id = emoji_id_field()
+    position = models.PositiveSmallIntegerField(default=0, help_text="Lower values are listed first.")
+
+    class Meta:
+        ordering = ("position", "id")
+        constraints = [models.UniqueConstraint(fields=("dragon", "ball"), name="dragonwish_unique_extra_per_dragon")]
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class DragonBall(models.Model):
     """
     A countryball that can be used as a dragon ball for a wish. The wish needs a number of different ones of its
@@ -136,12 +181,7 @@ class DragonBall(models.Model):
 
     dragon = models.ForeignKey(Dragon, on_delete=models.CASCADE, related_name="dragon_balls")
     ball = models.ForeignKey(Ball, on_delete=models.CASCADE, related_name="+")
-    emoji = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text="Emoji shown for this dragon ball, for example <:DB1:1355509169565859929>. "
-        "Leave empty to use the emoji of the countryball.",
-    )
+    emoji_id = emoji_id_field()
     position = models.PositiveSmallIntegerField(
         default=0, help_text="Order inside the set, the first dragon ball (1 star) should have the lowest value."
     )
@@ -188,11 +228,7 @@ class DragonSpecial(models.Model):
         help_text="Chance in percent that each rewarded character gets this special. "
         "All the chances of a wish cannot add up to more than 100.",
     )
-    emoji = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text="Emoji shown next to the chance. Leave empty to use the emoji of the special.",
-    )
+    emoji_id = emoji_id_field("ID of the emoji shown next to the chance. Leave empty to use the emoji of the special.")
     position = models.PositiveSmallIntegerField(default=0, help_text="Lower values are listed first.")
 
     class Meta:
