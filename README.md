@@ -5,16 +5,20 @@ panel (section "Dragon wish"):
 
 - **Wishes**: a name, the emoji and title of the set, how many characters and relics it gives.
   - **Activation countryballs**: any one of them activates the wish, it is not consumed.
-  - **Dragon balls**: the list of accepted countryballs, each with an optional emoji. Set *Required count* to ask for
-    only some of them (for example 4 for "any 4 different of these 8"), leave it empty to require all of them.
+  - **Extra required countryballs**: each one is required next to the activation countryball and the dragon balls,
+    with its own name (shown as its own field), and a setting for whether the wish deletes it.
+  - **Dragon balls**: the list of accepted countryballs. Set *Required count* to ask for only some of them (for
+    example 4 for "any 4 different of these 8"), leave it empty to require all of them.
   - **Reward countryballs**: limit the random rewards to these countryballs, with a relative weight. Leave empty to
     reward any enabled countryball (except dragon balls).
   - **Special chances**: any number of specials, each with its percentage. Their catch phrase is shown with the reward.
 - **Relics**: the countryballs counting as relics.
-- **Wish settings**: the words used everywhere (dragon, dragon ball(s), relic(s), relicborne), the special given by
-  relic crafting, and an optional list restricting what relic crafting can give.
+- **Wish settings**: the words used everywhere (dragon, dragon ball(s), relic(s), relicborne), the text of a random
+  character reward, how long a wish can stay inactive before it cancels itself, the layout of the completion command,
+  the special given by relic crafting, and an optional list restricting what relic crafting can give.
 
-Without an emoji, the emoji of the countryball is used.
+Every emoji is configured with its **ID** (the number at the end of `<:name:ID>`, or right click the emoji and choose
+Copy ID). Without an emoji, the emoji of the countryball is used.
 
 ## Installation
 
@@ -36,6 +40,10 @@ Staff members need the `dragonwish` permissions to see the new sections in the a
 
 - Consumed countryballs (dragon balls, relics) are soft deleted: they stay in the database, flagged as deleted.
 - Chances of specials are overall percentages, tried in order, and cannot add up to more than 100.
+- `/wish bulk add` chooses the dragon balls the player has the most copies of, picking randomly between equal
+  amounts, and takes the activation and extra required countryballs too.
+- A wish cancels itself (and unlocks its countryballs) after the configured number of minutes without an action.
+  Adding, removing, bulk adding or pressing a button resets the countdown.
 - Command names (`/wish`, `/wish craft relics`...) cannot be renamed from the admin panel, only the words in messages.
   Two exceptions: the completion command is `/wish <balls command name> completion`, using the name of your balls
   command, and the `/wish start` parameter is named after your dragon word. Changes to these apply after restarting
