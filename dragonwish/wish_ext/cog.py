@@ -2,6 +2,7 @@ import asyncio
 import enum
 import logging
 import random
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -288,9 +289,22 @@ class Wish(commands.GroupCog):
         self.crafting: set[int] = set()
 
     admin = app_commands.Group(name="admin", description="Admin commands for wish")
-    dbz = app_commands.Group(name="dbz", description="Completion commands for wish")
+    dbz = app_commands.Group(name=settings.balls_slash_name, description="Completion commands for wish")
     craft = app_commands.Group(name="craft", description="Relic crafting commands for wish")
     bulk = app_commands.Group(name="bulk", description="Bulk commands for wish")
+
+    async def cog_load(self):
+        # slash command parameter names cannot contain spaces or capitals, they are derived from the dragon word
+        wish_settings = await WishSettings.aload()
+        start = self.app_command.get_command("start")
+        if start is None:
+            return
+        name = re.sub(r"[^\w-]+", "_", wish_settings.dragon_name.strip().lower()).strip("_")[:32] or "dragon"
+        try:
+            app_commands.rename(dragon=name)(start)
+        except ValueError:
+            log.warning(f"{name!r} is not a valid command parameter name, using 'dragon'")
+            app_commands.rename(dragon="dragon")(start)
 
     async def cog_unload(self):
         # unlock what pending wishes were holding, since they cannot be resumed
@@ -874,7 +888,7 @@ class Wish(commands.GroupCog):
                 TextDisplay(
                     f"**{words.ball} completion of {user_obj.mention}**\n"
                     f"-# {words.balls} are obtainable from `/hourly`.\n"
-                    "-# Use `/dbz completion` for the full dex completion."
+                    f"-# Use `/{settings.balls_slash_name} completion` for the full dex completion."
                 ),
                 accessory=Thumbnail(user_obj.display_avatar.url),
             )
@@ -903,12 +917,20 @@ class Wish(commands.GroupCog):
         }
 
     def _relic_embed(
-        self, user: discord.User | discord.Member, relics: list[Relic], counts: dict[int, int], words: Words
+        self,
+        user: discord.User | discord.Member,
+        relics: list[Relic],
+        counts: dict[int, int],
+        words: Words,
+        wish_settings: WishSettings,
     ) -> discord.Embed:
+        special = wish_settings.relicborne_special
+        special_emoji = (special.emoji or "") if special else ""
         embed = discord.Embed(
             title=f"{words.relic} Crafting",
             description=(
-                f"Craft the {len(relics)} {words.relics.lower()} to receive a random 🌠{words.relicborne} character!\n"
+                f"Craft the {len(relics)} {words.relics.lower()} to receive "
+                f"a random {special_emoji}{words.relicborne} character!\n"
                 f"{words.relics} are obtainable from `/wish start` or `/daily`."
             ),
             color=discord.Colour.from_rgb(82, 92, 145),
@@ -930,7 +952,7 @@ class Wish(commands.GroupCog):
         Craft the relics!
         """
         await interaction.response.defer(thinking=True)
-        _, words = await self._words()
+        wish_settings, words = await self._words()
         relics = [x async for x in Relic.objects.select_related("ball")]
         if not relics:
             await interaction.followup.send(f"No {words.relic.lower()} is configured yet.", ephemeral=True)
@@ -938,7 +960,7 @@ class Wish(commands.GroupCog):
         counts = await self._relic_counts(interaction.user.id, relics)
         view = RelicCraftView(self, interaction.user.id)
         view.original_message = await interaction.followup.send(
-            embed=self._relic_embed(interaction.user, relics, counts, words), view=view, wait=True
+            embed=self._relic_embed(interaction.user, relics, counts, words, wish_settings), view=view, wait=True
         )
 
     async def craft_relics(self, interaction: discord.Interaction["BallsDexBot"]):
@@ -992,9 +1014,11 @@ class Wish(commands.GroupCog):
             text = f"{user.mention} You crafted **{ball.country}**! `({attack:+d}ATK/{health:+d}HP)`"
             if special:
                 phrase = special.catch_phrase or f"It's a {words.relicborne} character!"
-                text += f"\n\n***🌠 {phrase} 🌠***"
+                text += f"\n\n***{phrase}***"
             await interaction.followup.send(text)
-            await interaction.edit_original_response(embed=self._relic_embed(user, relics, counts, words))
+            await interaction.edit_original_response(
+                embed=self._relic_embed(user, relics, counts, words, wish_settings)
+            )
 
             await asyncio.sleep(5)
             new_view = RelicCraftView(self, user.id)
