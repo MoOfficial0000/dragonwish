@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from ballsdex.core.discord import LayoutView, View
 from ballsdex.core.utils import checks
+from ballsdex.core.utils.buttons import ConfirmChoiceView
 from ballsdex.core.utils.menus import ListSource, Menu, TextFormatter
 from ballsdex.core.utils.transformers import BallInstanceTransform, SpecialEnabledTransform, TTLModelTransformer
 from ballsdex.core.utils.utils import inventory_privacy, is_staff
@@ -44,6 +45,9 @@ LOCK_DURATION = timedelta(minutes=30)
 TOKEN_LIFETIME = timedelta(minutes=14, seconds=30)
 # the text of a completion page cannot go beyond 4000 characters, keep room for the header
 COMPLETION_PAGE_LIMIT = 3500
+# where players get what a wish requires, mentioned in the wish and completion messages
+DRAGON_BALL_SOURCE = "/hourly"
+EXTRA_SOURCE = "/daily"
 
 
 class DragonTransformer(TTLModelTransformer[Dragon]):
@@ -78,6 +82,32 @@ class RelicTransformer(TTLModelTransformer[Relic]):
 
 DragonTransform = app_commands.Transform[Dragon, DragonTransformer]
 RelicTransform = app_commands.Transform[Relic, RelicTransformer]
+
+
+class WishedBallTransformer(app_commands.Transformer):
+    """
+    Only suggests the countryballs the user added to their wish (activation, extra required and dragon balls).
+    """
+
+    @staticmethod
+    def _labels(interaction: discord.Interaction["BallsDexBot"]) -> list[tuple[BallInstance, str]]:
+        cog = interaction.client.get_cog("Wish")
+        session = cog.sessions.get(interaction.user.id) if isinstance(cog, Wish) else None
+        return cog.wished_labels(session) if isinstance(cog, Wish) and session else []
+
+    async def autocomplete(self, interaction: discord.Interaction["BallsDexBot"], value: str, /):
+        needle = value.lower().lstrip("#")
+        matches = [x for x in self._labels(interaction) if needle in x[1].lower()]
+        return [app_commands.Choice(name=label[:100], value=str(instance.pk)) for instance, label in matches][:25]
+
+    async def transform(self, interaction: discord.Interaction["BallsDexBot"], value: str, /):
+        for instance, label in self._labels(interaction):
+            if value == str(instance.pk) or value.lower() == label.lower():
+                return instance
+        return None
+
+
+WishedBallTransform = app_commands.Transform[BallInstance, WishedBallTransformer]
 
 
 @dataclass(frozen=True)
@@ -262,6 +292,25 @@ def with_emoji(emoji: str, text: str) -> str:
     return f"- {emoji} {text}" if emoji else f"- {text}"
 
 
+def source_hints(words: Words, extra_names: list[str]) -> str:
+    """
+    Small text lines telling where the required countryballs are obtained.
+    """
+    lines = [f"-# {words.balls} are obtainable from `{DRAGON_BALL_SOURCE}`."]
+    if extra_names:
+        names = extra_names[0] if len(extra_names) == 1 else f"{', '.join(extra_names[:-1])} and {extra_names[-1]}"
+        verb = "is" if len(extra_names) == 1 else "are"
+        lines.append(f"-# {names} {verb} obtained from `{EXTRA_SOURCE}`.")
+    return "\n".join(lines)
+
+
+def stats_text(instance: BallInstance, attack: int, health: int) -> str:
+    """
+    The ID and bonuses of a countryball that was just given, like (#1A2B, +5ATK%/-3HP%).
+    """
+    return f"`(#{instance.pk:0X}, {attack:+d}ATK%/{health:+d}HP%)`"
+
+
 def render_deck(lines: list[str], total: int) -> str:
     """
     Join lines for an embed field (1024 characters max), with a total if they had to be truncated.
@@ -366,6 +415,10 @@ class WishView(View):
     @button(style=discord.ButtonStyle.danger, emoji="✖", label="Cancel")
     async def cancel(self, interaction: discord.Interaction["BallsDexBot"], button: discord.ui.Button):
         await self.cog.cancel_wish(interaction)
+
+    @button(style=discord.ButtonStyle.secondary, label="Clear")
+    async def clear(self, interaction: discord.Interaction["BallsDexBot"], button: discord.ui.Button):
+        await self.cog.clear_wish(interaction)
 
 
 class RelicCraftView(View):
@@ -563,6 +616,20 @@ class Wish(commands.GroupCog):
     # embeds
     # ----------------------------------------------------------------------------------------------------------
 
+    def wished_labels(self, session: WishSession) -> list[tuple[BallInstance, str]]:
+        """
+        The countryballs in a wish, each with a label telling what it is used as.
+        """
+        words = session.words
+        entries = []
+        if session.dragon_instance:
+            entries.append((session.dragon_instance, words.activation))
+        for extra in session.extra_requirements:
+            if instance := session.extra_instances.get(extra.pk):
+                entries.append((instance, extra.name))
+        entries += [(x, words.ball) for x in session.ball_instances]
+        return [(instance, f"{instance.short_description(is_trade=True)} - {slot}") for instance, slot in entries]
+
     def _wish_emoji(self, session: WishSession) -> str:
         if session.dragon.emoji_id:
             return render_emoji(self.bot, session.dragon.emoji_id)
@@ -602,7 +669,11 @@ class Wish(commands.GroupCog):
             title=f"{settings.collectible_name.title()} Wishing {self._wish_emoji(session)} {self._set_emoji(session)}",
             description=(
                 "Use `/wish add`, `/wish remove` or `/wish bulk add` to add/remove requirements.\n"
-                "Requires:\n" + "\n".join(requirements) + "\n" + f"-# {words.balls} are obtainable from `/hourly`.\n"
+                "Requires:\n"
+                + "\n".join(requirements)
+                + "\n"
+                + source_hints(words, [x.name for x in session.extra_requirements])
+                + "\n"
                 "Click the tick button when ready.\n-------\n"
                 "Rewards:\n"
                 f"{reward_lines(self.bot, session.dragon, session.special_chances, words)}\n"
@@ -734,15 +805,59 @@ class Wish(commands.GroupCog):
         if self.sessions.get(interaction.user.id) is session:
             self._arm_timer(session)
 
+    @staticmethod
+    async def _confirm(interaction: discord.Interaction["BallsDexBot"], question: str) -> bool:
+        """
+        Ask the user to confirm with buttons only they can use, in a message only they see.
+        """
+        view = ConfirmChoiceView(interaction, accept_message="Confirmed.", cancel_message="Nothing was changed.")
+        await interaction.response.send_message(question, view=view, ephemeral=True)
+        await view.wait()
+        return view.value is True
+
     async def cancel_wish(self, interaction: discord.Interaction["BallsDexBot"]):
-        session = self.sessions.pop(interaction.user.id, None)
+        session = self.sessions.get(interaction.user.id)
         if session is None:
             await interaction.response.send_message("This wish doesn't belong to you.", ephemeral=True)
             return
+        self._arm_timer(session)  # pressing a button counts as an action
+        if not await self._confirm(
+            interaction, "Are you sure you want to cancel this wish? Everything you added is released."
+        ):
+            return
+        # the wish may have ended while waiting for the answer
+        if self.sessions.get(interaction.user.id) is not session:
+            await interaction.followup.send("This wish is already over.", ephemeral=True)
+            return
+        del self.sessions[interaction.user.id]
         self._disarm_timer(session)
-        await interaction.response.defer()
         await self._unlock_all(session.all_instances)
-        await interaction.edit_original_response(embed=self._cancelled_embed(session), view=None)
+        await self._edit_wish_message(session, embed=self._cancelled_embed(session), view=None)
+
+    async def clear_wish(self, interaction: discord.Interaction["BallsDexBot"]):
+        session = self.sessions.get(interaction.user.id)
+        if session is None:
+            await interaction.response.send_message("This wish doesn't belong to you.", ephemeral=True)
+            return
+        self._arm_timer(session)
+        if not session.all_instances:
+            await interaction.response.send_message("There is nothing to clear in your wish.", ephemeral=True)
+            return
+        if not await self._confirm(
+            interaction,
+            "Are you sure you want to remove everything from your wish? It stays open, and what you added is released.",
+        ):
+            return
+        if self.sessions.get(interaction.user.id) is not session:
+            await interaction.followup.send("This wish is already over.", ephemeral=True)
+            return
+        instances = session.all_instances
+        session.dragon_instance = None
+        session.extra_instances.clear()
+        session.ball_instances.clear()
+        await self._unlock_all(instances)
+        self._arm_timer(session)
+        await self._refresh(session)
 
     @app_commands.command()
     async def cancel(self, interaction: discord.Interaction["BallsDexBot"]):
@@ -839,11 +954,12 @@ class Wish(commands.GroupCog):
             attack = random.randint(-settings.max_attack_bonus, settings.max_attack_bonus)
             health = random.randint(-settings.max_health_bonus, settings.max_health_bonus)
             special = roll_special(session.special_chances)
-            await BallInstance.objects.acreate(
+            given = await BallInstance.objects.acreate(
                 ball=ball, player=player, special=special, attack_bonus=attack, health_bonus=health
             )
             emoji = emoji_or_default(self.bot, None, ball)
-            reward_text += f"{emoji} {ball.country}\n`{attack:+d}ATK/{health:+d}HP`{catch_phrase_text(special)}\n\n"
+            stats = stats_text(given, attack, health)
+            reward_text += f"{emoji} {ball.country}\n{stats}{catch_phrase_text(special)}\n\n"
 
         if dragon.relic_count:
             relics = [x async for x in Relic.objects.select_related("ball")]
@@ -910,26 +1026,19 @@ class Wish(commands.GroupCog):
         await self._refresh(session)
 
     @app_commands.command()
-    async def remove(
-        self,
-        interaction: discord.Interaction["BallsDexBot"],
-        countryball: BallInstanceTransform,
-        special: SpecialEnabledTransform | None = None,
-    ):
+    async def remove(self, interaction: discord.Interaction["BallsDexBot"], countryball: WishedBallTransform):
         """
         Removes a countryball from wish.
 
         Parameters
         ----------
         countryball: BallInstance
-            The countryball you want to remove.
-        special: Special
-            Filter the results of autocompletion to a special event. Ignored afterwards.
+            The countryball you want to remove, chosen among the ones in your wish.
         """
         session = await self._session_for(interaction)
         if session is None:
             return
-        if not self._try_remove(session, countryball):
+        if countryball is None or not self._try_remove(session, countryball):
             await interaction.response.send_message("You cannot remove what is not in your wish!", ephemeral=True)
             return
 
@@ -963,30 +1072,37 @@ class Wish(commands.GroupCog):
             await interaction.followup.send("There is nothing else to add!", ephemeral=True)
             return
 
-        # query 1: how many usable copies the user has of each wanted countryball
         eligible = eligible_instances(interaction.user.id)
-        counts = {
-            row["ball_id"]: row["total"]
-            async for row in eligible.filter(ball_id__in=wanted).values("ball_id").annotate(total=Count("id"))
-        }
+        if session.required >= len(session.dragon_balls):
+            # every dragon ball is needed anyway, so there is nothing to choose: take them in order
+            ranked = pool_ids
+            fetch_ids = wanted
+        else:
+            # query 1: how many usable copies the user has of each dragon ball
+            counts = {
+                row["ball_id"]: row["total"]
+                async for row in eligible.filter(ball_id__in=pool_ids).values("ball_id").annotate(total=Count("id"))
+            }
+            # the ones the user has the most copies of, a random one among equal amounts
+            ranked = [x for x in pool_ids if counts.get(x)]
+            random.shuffle(ranked)
+            ranked.sort(key=lambda x: counts[x], reverse=True)  # stable, so the shuffle breaks the ties
+            ranked = ranked[: max(slots, 0)]
+            fetch_ids = activation_ids + [x.ball_id for x in missing_extras] + ranked
 
-        # choose the dragon balls: the ones the user has the most copies of, a random one among equal amounts
-        candidates = [x for x in pool_ids if counts.get(x)]
-        random.shuffle(candidates)
-        candidates.sort(key=lambda x: counts[x], reverse=True)  # stable, so the shuffle breaks the ties
-        chosen_balls = candidates[: max(slots, 0)]
-        chosen_activation = next((x for x in activation_ids if counts.get(x)), None)
-        chosen_extras = [x.ball_id for x in missing_extras if counts.get(x.ball_id)]
+        # query 2: one usable copy of each wanted countryball
+        instances = {
+            x.ball_id: x
+            async for x in eligible.filter(ball_id__in=fetch_ids).order_by("ball_id", "pk").distinct("ball_id")
+        }
+        chosen_activation = next((x for x in activation_ids if x in instances), None)
+        chosen_extras = [x.ball_id for x in missing_extras if x.ball_id in instances]
+        chosen_balls = [x for x in ranked if x in instances][: max(slots, 0)]
         chosen = ([chosen_activation] if chosen_activation else []) + chosen_extras + chosen_balls
         if not chosen:
             await interaction.followup.send("There is nothing else to add!", ephemeral=True)
             return
-
-        # query 2: one usable copy of each chosen countryball
-        instances = {
-            x.ball_id: x
-            async for x in eligible.filter(ball_id__in=chosen).order_by("ball_id", "pk").distinct("ball_id")
-        }
+        instances = {key: value for key, value in instances.items() if key in chosen}
 
         # query 3: lock them all at once, only the ones that are still free
         now = timezone.now()
@@ -1118,21 +1234,23 @@ class Wish(commands.GroupCog):
             await interaction.followup.send("No wish is configured yet.", ephemeral=True)
             return
 
+        extra_names = list(dict.fromkeys(x.name for dragon in dragons for x in dragon.extra_requirements.all()))
         all_ids = {
             x.ball_id
             for dragon in dragons
             for x in [*dragon.activation_balls.all(), *dragon.extra_requirements.all(), *dragon.dragon_balls.all()]
         }
         owned = {
-            x
-            async for x in BallInstance.objects.filter(player__discord_id=user_obj.id, ball_id__in=all_ids)
-            .distinct()
-            .values_list("ball_id", flat=True)
+            row["ball_id"]: row["total"]
+            async for row in BallInstance.objects.filter(player__discord_id=user_obj.id, ball_id__in=all_ids)
+            .values("ball_id")
+            .annotate(total=Count("id"))
         }
 
         def line(ball_id: int, emoji: str, label: str) -> str:
-            mark = ":white_check_mark:" if ball_id in owned else ":x:"
-            return f"- {mark}{emoji}{label}"
+            amount = owned.get(ball_id, 0)
+            mark = ":white_check_mark:" if amount else ":x:"
+            return f"- {mark}{emoji}{label} x{amount}"
 
         if wish_settings.completion_layout == WishSettings.CompletionLayout.BY_BALLS:
             pages = build_pages(self._completion_by_balls(dragons, words, line))
@@ -1146,7 +1264,7 @@ class Wish(commands.GroupCog):
             Section(
                 TextDisplay(
                     f"**{words.ball} completion of {user_obj.mention}**\n"
-                    f"-# {words.balls} are obtainable from `/hourly`.\n"
+                    f"{source_hints(words, extra_names)}\n"
                     f"-# Use `/{settings.balls_slash_name} completion` for the full dex completion."
                 ),
                 accessory=Thumbnail(user_obj.display_avatar.url),
@@ -1266,10 +1384,10 @@ class Wish(commands.GroupCog):
             health = random.randint(-settings.max_health_bonus, settings.max_health_bonus)
             player, _ = await Player.objects.aget_or_create(discord_id=user.id)
             special = wish_settings.relicborne_special
-            await BallInstance.objects.acreate(
+            crafted = await BallInstance.objects.acreate(
                 ball=ball, player=player, special=special, attack_bonus=attack, health_bonus=health
             )
-            text = f"{user.mention} You crafted **{ball.country}**! `({attack:+d}ATK/{health:+d}HP)`"
+            text = f"{user.mention} You crafted **{ball.country}**! {stats_text(crafted, attack, health)}"
             if special:
                 phrase = special.catch_phrase or f"It's a {words.relicborne} character!"
                 text += f"\n\n***{phrase}***"
