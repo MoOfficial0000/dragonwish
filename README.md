@@ -32,7 +32,8 @@ enabled = true
 ```
 
 Rebuild and run the migrations as usual. A new install is filled with the dragons, emojis and relics of the v2 package,
-looking countryballs up by name (relics by ID 321 to 324). Whatever cannot be found is skipped.
+looking countryballs up by name (including the four "Relic of ..." ones). Whatever cannot be found is skipped,
+so on another dex the package simply starts empty and you configure everything in the admin panel.
 
 Staff members need the `dragonwish` permissions to see the new sections in the admin panel.
 
