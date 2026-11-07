@@ -41,8 +41,16 @@ Staff members need the `dragonwish` permissions to see the new sections in the a
 
 - Consumed countryballs (dragon balls, relics) are soft deleted: they stay in the database, flagged as deleted.
 - Chances of specials are overall percentages, tried in order, and cannot add up to more than 100.
+- The wish screen has Wish, Cancel and Clear buttons. Cancel and Clear ask for confirmation first. Clear releases
+  everything that was added but keeps the wish open.
+- `/wish remove` only suggests the countryballs that were added to the wish.
+- Rewards show the ID and bonuses of what was given, like `(#1A2B, +5ATK%/-3HP%)`.
+- The completion command shows how many of each countryball the player has.
+- The wish and completion messages say that dragon balls come from `/hourly` and extra required countryballs from
+  `/daily`. Those two commands are constants at the top of `dragonwish/wish_ext/cog.py`.
 - `/wish bulk add` chooses the dragon balls the player has the most copies of, picking randomly between equal
-  amounts, and takes the activation and extra required countryballs too.
+  amounts (in order when every dragon ball is required anyway), and takes the activation and extra required
+  countryballs too.
 - A wish cancels itself (and unlocks its countryballs) after the configured number of minutes without an action.
   Adding, removing, bulk adding or pressing a button resets the countdown.
 - Command names (`/wish`, `/wish craft relics`...) cannot be renamed from the admin panel, only the words in messages.
