@@ -1,7 +1,8 @@
 """
 Fill the dragons, dragon balls, emojis and relics that were hardcoded in the v2 wish package.
 
-Countryballs are looked up by name (and relics by ID), anything that cannot be found is skipped. Nothing happens if
+Countryballs are looked up by name, anything that cannot be found is skipped (so nothing is added on a dex
+without these countryballs). Nothing happens if
 dragons already exist. Everything can be edited afterwards in the admin panel.
 """
 
@@ -122,7 +123,7 @@ DRAGONS = [
     ),
 ]
 
-RELIC_IDS = [321, 322, 323, 324]
+RELIC_NAMES = ["Relic of Tyranny", "Relic of Destruction", "Relic of Monarchy", "Relic of Divinity"]
 
 
 def seed(apps, schema_editor):
@@ -139,17 +140,17 @@ def seed(apps, schema_editor):
     ):
         dragon_ball = Ball.objects.filter(country=name).first()
         if dragon_ball is None:
-            log.warning(f"Skipping dragon {name!r}: no countryball with this name")
+            log.info(f"Skipping dragon {name!r}: no countryball with this name")
             continue
         found = []
         for index, (ball_name, ball_emoji) in enumerate(dragon_balls, start=1):
             ball = Ball.objects.filter(country=ball_name).first()
             if ball is None:
-                log.warning(f"Skipping dragon ball {ball_name!r} of {name!r}: no countryball with this name")
+                log.info(f"Skipping dragon ball {ball_name!r} of {name!r}: no countryball with this name")
                 continue
             found.append((index, ball, ball_emoji))
         if not found:
-            log.warning(f"Skipping dragon {name!r}: none of its dragon balls exist")
+            log.info(f"Skipping dragon {name!r}: none of its dragon balls exist")
             continue
 
         dragon = Dragon.objects.create(
@@ -166,7 +167,7 @@ def seed(apps, schema_editor):
         for index, ball, ball_emoji in found:
             DragonBall.objects.create(dragon=dragon, ball=ball, emoji=ball_emoji, position=index)
 
-    for ball in Ball.objects.filter(pk__in=RELIC_IDS):
+    for ball in Ball.objects.filter(country__in=RELIC_NAMES):
         Relic.objects.create(ball=ball)
 
 
