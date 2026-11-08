@@ -82,7 +82,13 @@ class ActivationBallInline(admin.TabularInline):
 
 
 class ExtraRequirementFormSet(UniqueEntriesFormSet):
-    pass
+    # every part of the wish screen is a few components and Discord limits a message to 40 of them
+    maximum = 4
+
+    def clean_entries(self, form_data: list[dict]):
+        total = len([x for x in form_data if x.get("ball")])
+        if total > self.maximum:
+            raise ValidationError(f"A wish supports at most {self.maximum} extra required countryballs, not {total}.")
 
 
 class ExtraRequirementInline(admin.TabularInline):
