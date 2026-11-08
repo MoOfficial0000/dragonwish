@@ -311,24 +311,28 @@ def stats_text(instance: BallInstance, attack: int, health: int) -> str:
     return f"`(#{instance.pk:0X}, {attack:+d}ATK%/{health:+d}HP%)`"
 
 
-def render_deck(lines: list[str], total: int) -> str:
+def deck_chunks(lines: list[str], limit: int = 1024) -> list[str]:
     """
-    Join lines for an embed field (1024 characters max), with a total if they had to be truncated.
+    Split lines into parts that each fit in an embed field (1024 characters), without cutting a line.
     """
-    if not lines:
-        return "Empty"
-    deck = "\n".join(lines)
-    if len(deck) <= 1024:
-        return deck
-
-    suffix = f"\nTotal: {total}"
-    truncated = ""
+    chunks: list[str] = []
+    current: list[str] = []
     for line in lines:
-        candidate = f"{truncated}\n{line}" if truncated else line
-        if len(candidate) > 1024 - len(suffix):
-            break
-        truncated = candidate
-    return truncated + suffix
+        if current and len("\n".join([*current, line])) > limit:
+            chunks.append("\n".join(current))
+            current = []
+        current.append(line)
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or ["Empty"]
+
+
+def add_deck_fields(embed: discord.Embed, name: str, lines: list[str]):
+    """
+    Add a list to an embed. When it does not fit in one field it continues in the next one, nothing is cut.
+    """
+    for index, chunk in enumerate(deck_chunks([x for x in lines if x])):
+        embed.add_field(name=name if index == 0 else "\u200b", value=chunk, inline=True)
 
 
 def add_chunked_field(embed: discord.Embed, name: str, text: str):
@@ -688,14 +692,14 @@ class Wish(commands.GroupCog):
         if session.dragon_instance:
             emoji = activation_emojis.get(session.dragon_instance.ball_id, "")
             activation_lines.append(with_emoji(emoji, session.dragon_instance.short_description(is_trade=True)))
-        embed.add_field(name=f"{words.activation}:", value=render_deck(activation_lines, 1), inline=True)
+        add_deck_fields(embed, f"{words.activation}:", activation_lines)
 
         for extra in session.extra_requirements:
             lines = []
             if instance := session.extra_instances.get(extra.pk):
                 emoji = emoji_or_default(self.bot, extra.emoji_id, extra.ball)
                 lines.append(with_emoji(emoji, instance.short_description(is_trade=True)))
-            embed.add_field(name=f"{extra.name}:", value=render_deck(lines, 1), inline=True)
+            add_deck_fields(embed, f"{extra.name}:", lines)
 
         ball_emojis = {x.ball_id: emoji_or_default(self.bot, x.emoji_id, x.ball) for x in session.dragon_balls}
         ball_lines = [
@@ -703,9 +707,7 @@ class Wish(commands.GroupCog):
             for x in session.ball_instances
         ]
         progress = f" ({len(session.ball_instances)}/{required})" if required < total else ""
-        embed.add_field(
-            name=f"{words.balls}{progress}:", value=render_deck(ball_lines, len(session.ball_instances)), inline=True
-        )
+        add_deck_fields(embed, f"{words.balls}{progress}:", ball_lines)
 
         # when there is a choice of activation countryball, tell what can be used
         if len(session.activation_balls) > 1:
@@ -729,7 +731,7 @@ class Wish(commands.GroupCog):
         )
         prefix = ":no_entry_sign: " if cancelled else ""
         for name, text in fields:
-            embed.add_field(name=f"{prefix}{name}:", value=text, inline=True)
+            add_deck_fields(embed, f"{prefix}{name}:", text.split("\n"))
         if reward_text:
             add_chunked_field(embed, "Reward:", reward_text)
         return embed
@@ -933,7 +935,7 @@ class Wish(commands.GroupCog):
             emoji = "⛔" if extra.consumed else emoji_or_default(self.bot, extra.emoji_id, extra.ball)
             fields.append((extra.name, with_emoji(emoji, instance.short_description(is_trade=True))))
         ball_lines = [with_emoji("⛔", x.short_description(is_trade=True)) for x in session.ball_instances]
-        fields.append((words.balls, render_deck(ball_lines, len(ball_lines))))
+        fields.append((words.balls, "\n".join(ball_lines)))
 
         # consume what is deleted by the wish, and release the rest
         consumed = list(session.ball_instances)
