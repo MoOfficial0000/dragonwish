@@ -4,17 +4,18 @@ import logging
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
 from discord.ext import commands
-from discord.ui import Container, Section, Separator, TextDisplay, Thumbnail, button
+from discord.ui import ActionRow, Section, Separator, TextDisplay, Thumbnail, button
+from discord.utils import format_dt, utcnow
 from django.db.models import Count, Q
 from django.utils import timezone
 
-from ballsdex.core.discord import LayoutView, View
+from ballsdex.core.discord import Container, LayoutView, View
 from ballsdex.core.utils import checks
 from ballsdex.core.utils.buttons import ConfirmChoiceView
 from ballsdex.core.utils.menus import ListSource, Menu, TextFormatter
@@ -45,6 +46,8 @@ LOCK_DURATION = timedelta(minutes=30)
 TOKEN_LIFETIME = timedelta(minutes=14, seconds=30)
 # the text of a completion page cannot go beyond 4000 characters, keep room for the header
 COMPLETION_PAGE_LIMIT = 3500
+# a message made of components holds 4000 characters of text in total, keep some room
+TEXT_LIMIT = 3900
 # where players get what a wish requires, mentioned in the wish and completion messages
 DRAGON_BALL_SOURCE = "/hourly"
 EXTRA_SOURCE = "/daily"
@@ -170,6 +173,9 @@ class WishSession:
     ball_instances: list[BallInstance] = field(default_factory=list)
     message_id: int | None = None
     timer: asyncio.TimerHandle | None = None
+    deadline: datetime | None = None
+    view: "WishView | None" = None
+    edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
     def required(self) -> int:
@@ -311,44 +317,29 @@ def stats_text(instance: BallInstance, attack: int, health: int) -> str:
     return f"`(#{instance.pk:0X}, {attack:+d}ATK%/{health:+d}HP%)`"
 
 
-def deck_chunks(lines: list[str], limit: int = 1024) -> list[str]:
+def enforce_text_limit(displays: list[TextDisplay], limit: int = TEXT_LIMIT):
     """
-    Split lines into parts that each fit in an embed field (1024 characters), without cutting a line.
+    Components messages hold 4000 characters of text in total. Shorten the longest lists if a wish is too big.
     """
-    chunks: list[str] = []
-    current: list[str] = []
-    for line in lines:
-        if current and len("\n".join([*current, line])) > limit:
-            chunks.append("\n".join(current))
-            current = []
-        current.append(line)
-    if current:
-        chunks.append("\n".join(current))
-    return chunks or ["Empty"]
+    while (overflow := sum(len(x.content) for x in displays) - limit) > 0:
+        longest = max(displays, key=lambda x: len(x.content))
+        lines = longest.content.split("\n")
+        if len(lines) <= 2:
+            break
+        cut = removed = 0
+        while cut < len(lines) - 2 and removed < overflow + 40:
+            cut += 1
+            removed += len(lines[-cut]) + 1
+        longest.content = "\n".join([*lines[:-cut], f"-# …and {cut} more"])
 
 
-def add_deck_fields(embed: discord.Embed, name: str, lines: list[str]):
+def progress_colour(done: int, needed: int) -> discord.Colour:
     """
-    Add a list to an embed. When it does not fit in one field it continues in the next one, nothing is cut.
+    Red when nothing was added yet, gold while incomplete, green when complete.
     """
-    for index, chunk in enumerate(deck_chunks([x for x in lines if x])):
-        embed.add_field(name=name if index == 0 else "\u200b", value=chunk, inline=True)
-
-
-def add_chunked_field(embed: discord.Embed, name: str, text: str):
-    """
-    Add a field to an embed, splitting it across several fields if it exceeds the 1024 characters limit.
-    """
-    chunk = ""
-    first = True
-    for line in text.split("\n"):
-        if chunk and len(chunk) + len(line) + 1 > 1024:
-            embed.add_field(name=name if first else "\u200b", value=chunk, inline=False)
-            first = False
-            chunk = ""
-        chunk = f"{chunk}\n{line}" if chunk else line
-    if chunk.strip():
-        embed.add_field(name=name if first else "\u200b", value=chunk, inline=False)
+    if done >= needed:
+        return discord.Colour.green()
+    return discord.Colour.gold() if done else discord.Colour.red()
 
 
 def split_section(section: str, limit: int) -> list[str]:
@@ -405,23 +396,185 @@ def reward_lines(bot: "BallsDexBot", dragon: Dragon, chances: list[DragonSpecial
     return "\n".join(lines)
 
 
-class WishView(View):
-    def __init__(self, cog: "Wish", user_id: int):
-        # the wish cancels itself after a while without actions, see Wish._arm_timer
+class WishPart(Container):
+    """
+    One part of the wish screen: the activation countryball, an extra required countryball, or the dragon balls.
+    """
+
+    def __init__(self, *, compact: bool):
+        super().__init__()
+        self.heading = TextDisplay("-")
+        self.deck = TextDisplay("-")
+        self.add_item(self.heading)
+        if not compact:
+            self.add_item(Separator())
+        self.add_item(self.deck)
+
+
+class WishView(LayoutView):
+    """
+    The wish screen, laid out like a trade: a header, one coloured part per requirement, the buttons, and a note
+    telling when the wish cancels itself. It is built once and its texts are updated with refresh().
+    """
+
+    buttons = ActionRow()
+
+    def __init__(self, cog: "Wish", session: WishSession):
         super().__init__(timeout=None)
         self.cog = cog
-        self.restrict_author(user_id)
+        self.session = session
+        self.restrict_author(session.user.id)
+        # a message holds 40 components at most, drop the separators of the parts if there are many extras
+        compact = len(session.extra_requirements) > 4
 
-    @button(style=discord.ButtonStyle.success, emoji="✔", label="Wish")
-    async def wish(self, interaction: discord.Interaction["BallsDexBot"], button: discord.ui.Button):
+        self.header_title = TextDisplay("-")
+        self.header_info = TextDisplay("-")
+        self.requires = TextDisplay("-")
+        self.rewards = TextDisplay("-")
+        self.header_section = Section(
+            self.header_title, self.header_info, accessory=Thumbnail(session.user.display_avatar.url)
+        )
+        self.header = Container(accent_colour=discord.Colour.blurple())
+        self.activation = WishPart(compact=compact)
+        self.extras = [WishPart(compact=compact) for _ in session.extra_requirements]
+        self.balls = WishPart(compact=compact)
+        self.status = TextDisplay("-")
+        self._build_header(with_requirements=True)
+
+        self.clear_items()
+        for item in (self.header, self.activation, *self.extras, self.balls, self.buttons, self.status):
+            self.add_item(item)
+
+    def _build_header(self, *, with_requirements: bool, with_rewards: bool = True):
+        self.header.clear_items()
+        self.header.add_item(self.header_section)
+        if with_requirements:
+            self.header.add_item(Separator())
+            self.header.add_item(self.requires)
+        if with_rewards:
+            self.header.add_item(Separator())
+            self.header.add_item(self.rewards)
+
+    def _all_displays(self) -> list[TextDisplay]:
+        parts = [self.activation, *self.extras, self.balls]
+        return [
+            self.header_title,
+            self.header_info,
+            self.requires,
+            self.rewards,
+            self.status,
+            *[x.heading for x in parts],
+            *[x.deck for x in parts],
+        ]
+
+    def refresh(self):
+        """
+        Update the texts and colors from the current state of the wish.
+        """
+        session = self.session
+        bot = self.cog.bot
+        words = session.words
+        total = len(session.dragon_balls)
+        required = session.required
+        kept = "Will **__not be deleted__** after the wish"
+        deleted = "Will **__be deleted__** after the wish"
+
+        if len(session.activation_balls) > 1:
+            activation_need = f"Any one {words.activation} out of the {len(session.activation_balls)} accepted ones"
+        else:
+            activation_need = words.activation
+        if required < total:
+            balls_need = f"Any {required} different {words.balls} out of the {total} {words.balls}"
+        else:
+            balls_need = words.balls
+        requirements = [f"- {activation_need} ({kept})"]
+        requirements += [f"- {x.name} ({deleted if x.consumed else kept})" for x in session.extra_requirements]
+        requirements.append(f"- {balls_need} ({deleted})")
+
+        emojis = f"{self.cog._wish_emoji(session)} {self.cog._set_emoji(session)}"
+        self.header_title.content = f"## {settings.collectible_name.title()} Wishing {emojis}".strip()
+        self.header_info.content = (
+            f"{session.user.display_name}'s wish: **{session.dragon.name}**\n"
+            "Use `/wish add`, `/wish remove` or `/wish bulk add` to add/remove requirements. "
+            "Click the tick button when ready."
+        )
+        extra_names = [x.name for x in session.extra_requirements]
+        self.requires.content = "**Requires:**\n" + "\n".join(requirements) + "\n" + source_hints(words, extra_names)
+        self.rewards.content = f"**Rewards:**\n{reward_lines(bot, session.dragon, session.special_chances, words)}"
+
+        # the activation countryball
+        activation_emojis = {x.ball_id: emoji_or_default(bot, x.emoji_id, x.ball) for x in session.activation_balls}
+        lines = []
+        if session.dragon_instance:
+            emoji = activation_emojis.get(session.dragon_instance.ball_id, "")
+            lines.append(with_emoji(emoji, session.dragon_instance.short_description(is_trade=True)))
+        heading = f"## {words.activation}\n-# {kept}"
+        if len(session.activation_balls) > 1:
+            accepted = ", ".join(
+                f"{activation_emojis[x.ball_id]} {x.ball.country}".strip() for x in session.activation_balls
+            )
+            heading += f"\n-# Any one of: {accepted}"
+        self.activation.heading.content = heading
+        self.activation.deck.content = "\n".join(lines) or "Empty"
+        self.activation.accent_colour = progress_colour(len(lines), 1)
+
+        # the extra required countryballs
+        for part, extra in zip(self.extras, session.extra_requirements):
+            instance = session.extra_instances.get(extra.pk)
+            emoji = emoji_or_default(bot, extra.emoji_id, extra.ball)
+            part.heading.content = f"## {extra.name}\n-# {deleted if extra.consumed else kept}"
+            part.deck.content = with_emoji(emoji, instance.short_description(is_trade=True)) if instance else "Empty"
+            part.accent_colour = progress_colour(1 if instance else 0, 1)
+
+        # the dragon balls
+        ball_emojis = {x.ball_id: emoji_or_default(bot, x.emoji_id, x.ball) for x in session.dragon_balls}
+        ball_lines = [
+            with_emoji(ball_emojis.get(x.ball_id, ""), x.short_description(is_trade=True))
+            for x in session.ball_instances
+        ]
+        heading = f"## {words.balls}\n-# {len(ball_lines)}/{required} added • {deleted}"
+        if required < total:
+            heading += f"\n-# Any {required} different out of the {total}"
+        self.balls.heading.content = heading
+        self.balls.deck.content = "\n".join(ball_lines) or "Empty"
+        self.balls.accent_colour = progress_colour(len(ball_lines), required)
+
+        if session.deadline is not None:
+            self.status.content = (
+                f"-# This wish cancels itself {format_dt(session.deadline, style='R')} if nothing happens."
+            )
+        enforce_text_limit(self._all_displays())
+
+    def show_result(
+        self, *, colour: discord.Colour, description: str, fields: list[tuple[str, str]], reward_text: str | None = None
+    ):
+        """
+        Turn the screen into the final state of the wish: buttons and timer note are removed.
+        """
+        self.header_title.content = f"## {settings.collectible_name.title()} Wishing"
+        self.header_info.content = description
+        self.header.accent_colour = colour
+        self.rewards.content = f"**Reward:**\n{reward_text}" if reward_text else "-"
+        self._build_header(with_requirements=False, with_rewards=bool(reward_text))
+        for part, (name, text) in zip([self.activation, *self.extras, self.balls], fields):
+            part.heading.content = f"## {name}"
+            part.deck.content = text or "Empty"
+            part.accent_colour = colour
+        self.remove_item(self.buttons)
+        self.remove_item(self.status)
+        enforce_text_limit(self._all_displays())
+        self.stop()
+
+    @buttons.button(label="Wish", emoji="✔", style=discord.ButtonStyle.success)
+    async def wish_button(self, interaction: discord.Interaction["BallsDexBot"], button: discord.ui.Button):
         await self.cog.start_wish(interaction)
 
-    @button(style=discord.ButtonStyle.danger, emoji="✖", label="Cancel")
-    async def cancel(self, interaction: discord.Interaction["BallsDexBot"], button: discord.ui.Button):
+    @buttons.button(label="Cancel", emoji="✖", style=discord.ButtonStyle.danger)
+    async def cancel_button(self, interaction: discord.Interaction["BallsDexBot"], button: discord.ui.Button):
         await self.cog.cancel_wish(interaction)
 
-    @button(style=discord.ButtonStyle.secondary, label="Clear")
-    async def clear(self, interaction: discord.Interaction["BallsDexBot"], button: discord.ui.Button):
+    @buttons.button(label="Clear", style=discord.ButtonStyle.secondary)
+    async def clear_button(self, interaction: discord.Interaction["BallsDexBot"], button: discord.ui.Button):
         await self.cog.clear_wish(interaction)
 
 
@@ -569,6 +722,7 @@ class Wish(commands.GroupCog):
         (Re)start the countdown after which the wish cancels itself. Every action of the user resets it.
         """
         self._disarm_timer(session)
+        session.deadline = utcnow() + timedelta(seconds=session.timeout)
         session.timer = asyncio.get_running_loop().call_later(session.timeout, self._spawn_expire, session)
 
     @staticmethod
@@ -589,8 +743,7 @@ class Wish(commands.GroupCog):
         del self.sessions[session.user.id]
         session.timer = None
         await self._unlock_all(session.all_instances)
-        embed = self._cancelled_embed(session, "The wish has been cancelled, it was inactive for too long.")
-        await self._edit_wish_message(session, embed=embed, view=None)
+        await self._show_cancelled(session, "The wish has been cancelled, it was inactive for too long.")
 
     async def _edit_wish_message(self, session: WishSession, **kwargs) -> bool:
         """
@@ -614,7 +767,12 @@ class Wish(commands.GroupCog):
             return False
 
     async def _refresh(self, session: WishSession):
-        await self._edit_wish_message(session, embed=self._setup_embed(session))
+        # one edit at a time, each one built from the state as it is when it runs
+        async with session.edit_lock:
+            if session.view is None or session.view.is_finished():
+                return
+            session.view.refresh()
+            await self._edit_wish_message(session, view=session.view)
 
     # ----------------------------------------------------------------------------------------------------------
     # embeds
@@ -650,105 +808,22 @@ class Wish(commands.GroupCog):
             return emoji_or_default(self.bot, first.emoji_id, first.ball)
         return ""
 
-    def _setup_embed(self, session: WishSession) -> discord.Embed:
-        words = session.words
-        total = len(session.dragon_balls)
-        required = session.required
-        kept = "Will **__not be deleted__** after the wish"
-        deleted = "Will **__be deleted__** after the wish"
-
-        if len(session.activation_balls) > 1:
-            activation_need = f"Any one {words.activation} out of the {len(session.activation_balls)} accepted ones"
-        else:
-            activation_need = words.activation
-        if required < total:
-            balls_need = f"Any {required} different {words.balls} out of the {total} {words.balls}"
-        else:
-            balls_need = words.balls
-        requirements = [f"- {activation_need} ({kept})"]
-        requirements += [f"- {x.name} ({deleted if x.consumed else kept})" for x in session.extra_requirements]
-        requirements.append(f"- {balls_need} ({deleted})")
-
-        embed = discord.Embed(
-            title=f"{settings.collectible_name.title()} Wishing {self._wish_emoji(session)} {self._set_emoji(session)}",
-            description=(
-                "Use `/wish add`, `/wish remove` or `/wish bulk add` to add/remove requirements.\n"
-                "Requires:\n"
-                + "\n".join(requirements)
-                + "\n"
-                + source_hints(words, [x.name for x in session.extra_requirements])
-                + "\n"
-                "Click the tick button when ready.\n-------\n"
-                "Rewards:\n"
-                f"{reward_lines(self.bot, session.dragon, session.special_chances, words)}\n"
-            ),
-            color=discord.Colour.from_rgb(255, 255, 255),
-        )
-
-        activation_emojis = {
-            x.ball_id: emoji_or_default(self.bot, x.emoji_id, x.ball) for x in session.activation_balls
-        }
-        activation_lines = []
-        if session.dragon_instance:
-            emoji = activation_emojis.get(session.dragon_instance.ball_id, "")
-            activation_lines.append(with_emoji(emoji, session.dragon_instance.short_description(is_trade=True)))
-        add_deck_fields(embed, f"{words.activation}:", activation_lines)
-
-        for extra in session.extra_requirements:
-            lines = []
-            if instance := session.extra_instances.get(extra.pk):
-                emoji = emoji_or_default(self.bot, extra.emoji_id, extra.ball)
-                lines.append(with_emoji(emoji, instance.short_description(is_trade=True)))
-            add_deck_fields(embed, f"{extra.name}:", lines)
-
-        ball_emojis = {x.ball_id: emoji_or_default(self.bot, x.emoji_id, x.ball) for x in session.dragon_balls}
-        ball_lines = [
-            with_emoji(ball_emojis.get(x.ball_id, ""), x.short_description(is_trade=True))
-            for x in session.ball_instances
-        ]
-        progress = f" ({len(session.ball_instances)}/{required})" if required < total else ""
-        add_deck_fields(embed, f"{words.balls}{progress}:", ball_lines)
-
-        # when there is a choice of activation countryball, tell what can be used
-        if len(session.activation_balls) > 1:
-            accepted = "\n".join(
-                with_emoji(activation_emojis[x.ball_id], x.ball.country) for x in session.activation_balls
-            )
-            add_chunked_field(embed, f"Accepted {words.activation}:", accepted)
-        return embed
-
-    @staticmethod
-    def _result_embed(
-        color: discord.Colour,
-        *,
-        description: str,
-        fields: list[tuple[str, str]],
-        reward_text: str | None = None,
-        cancelled: bool = False,
-    ) -> discord.Embed:
-        embed = discord.Embed(
-            title=f"{settings.collectible_name.title()} Wishing", description=description, color=color
-        )
-        prefix = ":no_entry_sign: " if cancelled else ""
-        for name, text in fields:
-            add_deck_fields(embed, f"{prefix}{name}:", text.split("\n"))
-        if reward_text:
-            add_chunked_field(embed, "Reward:", reward_text)
-        return embed
-
     @staticmethod
     def _field_names(session: WishSession) -> list[str]:
         return [session.words.activation, *[x.name for x in session.extra_requirements], session.words.balls]
 
-    def _cancelled_embed(
-        self, session: WishSession, description: str = "The wish has been cancelled."
-    ) -> discord.Embed:
-        return self._result_embed(
-            discord.Color.red(),
+    async def _show_cancelled(self, session: WishSession, description: str = "The wish has been cancelled."):
+        """
+        Turn the wish screen into its cancelled state.
+        """
+        if session.view is None:
+            return
+        session.view.show_result(
+            colour=discord.Colour.red(),
             description=description,
             fields=[(name, "Cancelled") for name in self._field_names(session)],
-            cancelled=True,
         )
+        await self._edit_wish_message(session, view=session.view)
 
     # ----------------------------------------------------------------------------------------------------------
     # starting, cancelling and finishing a wish
@@ -795,10 +870,11 @@ class Wish(commands.GroupCog):
             special_chances,
             timeout=wish_settings.wish_timeout_minutes * 60,
         )
+        session.view = WishView(self, session)
+        session.deadline = utcnow() + timedelta(seconds=session.timeout)
+        session.view.refresh()
         self.sessions[interaction.user.id] = session
-        await interaction.response.send_message(
-            embed=self._setup_embed(session), view=WishView(self, interaction.user.id)
-        )
+        await interaction.response.send_message(view=session.view)
         try:
             session.message_id = (await interaction.original_response()).id
         except discord.HTTPException:
@@ -834,7 +910,7 @@ class Wish(commands.GroupCog):
         del self.sessions[interaction.user.id]
         self._disarm_timer(session)
         await self._unlock_all(session.all_instances)
-        await self._edit_wish_message(session, embed=self._cancelled_embed(session), view=None)
+        await self._show_cancelled(session)
 
     async def clear_wish(self, interaction: discord.Interaction["BallsDexBot"]):
         session = self.sessions.get(interaction.user.id)
@@ -873,7 +949,7 @@ class Wish(commands.GroupCog):
         self._disarm_timer(session)
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self._unlock_all(session.all_instances)
-        await self._edit_wish_message(session, embed=self._cancelled_embed(session), view=None)
+        await self._show_cancelled(session)
         await interaction.followup.send("Your current wish has been frozen and cancelled.", ephemeral=True)
 
     async def start_wish(self, interaction: discord.Interaction["BallsDexBot"]):
@@ -892,17 +968,17 @@ class Wish(commands.GroupCog):
         self._disarm_timer(session)
         instances = session.all_instances
         try:
-            embed = await self._grant_wish(session, instances)
+            result = await self._grant_wish(session, instances)
         except Exception:
             log.exception(f"Wish of {interaction.user.id} failed")
             await self._unlock_all(instances)
             await interaction.followup.send("Something went wrong, your wish was cancelled.", ephemeral=True)
             return
-        await interaction.edit_original_response(
-            content=f"{interaction.user.mention}'s reward(s)", embed=embed, view=None
-        )
+        assert session.view is not None
+        session.view.show_result(**result)
+        await interaction.edit_original_response(view=session.view)
 
-    async def _grant_wish(self, session: WishSession, instances: list[BallInstance]) -> discord.Embed:
+    async def _grant_wish(self, session: WishSession, instances: list[BallInstance]) -> dict:
         user = session.user
         dragon = session.dragon
         words = session.words
@@ -912,13 +988,12 @@ class Wish(commands.GroupCog):
         owned = await BallInstance.objects.filter(pk__in=[x.pk for x in instances], player__discord_id=user.id).acount()
         if owned != len(instances):
             await self._unlock_all(instances)
-            return self._result_embed(
-                discord.Color.dark_orange(),
-                description=f"Wishing of {user.mention}",
-                fields=[(name, "Cancelled") for name in self._field_names(session)],
-                reward_text=f"⚠️ One or more {words.balls} do not belong to you.\nThis wish has been cancelled.",
-                cancelled=True,
-            )
+            return {
+                "colour": discord.Colour.dark_orange(),
+                "description": f"Wishing of {user.mention}",
+                "fields": [(name, "Cancelled") for name in self._field_names(session)],
+                "reward_text": f"⚠️ One or more {words.balls} do not belong to you.\nThis wish has been cancelled.",
+            }
 
         # rendered now, a deleted countryball is displayed differently
         activation = next((x for x in session.activation_balls if x.ball_id == session.dragon_instance.ball_id), None)
@@ -974,12 +1049,12 @@ class Wish(commands.GroupCog):
                 )
                 reward_text += f"{emoji_or_default(self.bot, None, relic.ball)} {relic.ball.country}\n"
 
-        return self._result_embed(
-            discord.Color.green(),
-            description=f"Wishing of {user.mention}",
-            fields=fields,
-            reward_text=reward_text or "Nothing.",
-        )
+        return {
+            "colour": discord.Colour.green(),
+            "description": f"Wishing of {user.mention}",
+            "fields": fields,
+            "reward_text": reward_text.strip() or "Nothing.",
+        }
 
     # ----------------------------------------------------------------------------------------------------------
     # adding and removing materials
