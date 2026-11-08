@@ -1,6 +1,6 @@
 [project]
 name = "ballsdex-dragonwish"
-version = "1.4.0"
+version = "1.4.1"
 description = "Dragon wishing for Ballsdex 3: gather dragon balls, summon a dragon, get rewards. Dragons, balls, emojis and relics are configured from the admin panel."
 readme = "README.md"
 requires-python = ">=3.14"
