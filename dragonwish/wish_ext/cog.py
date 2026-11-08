@@ -392,7 +392,7 @@ def reward_lines(bot: "BallsDexBot", dragon: Dragon, chances: list[DragonSpecial
     lines = [f"- **{words.reward}{suffix}**"] * dragon.reward_count
     if dragon.relic_count:
         plural = "" if dragon.relic_count == 1 else "s"
-        lines.append(f"- -# **{dragon.relic_count}× {words.relic} Drop{plural}!**")
+        lines.append(f"- **{dragon.relic_count}× {words.relic} Drop{plural}!**")
     return "\n".join(lines)
 
 
