@@ -43,7 +43,12 @@ Staff members need the `dragonwish` permissions to see the new sections in the a
 - Chances of specials are overall percentages, tried in order, and cannot add up to more than 100.
 - The wish screen has Wish, Cancel and Clear buttons. Cancel and Clear ask for confirmation first. Clear releases
   everything that was added but keeps the wish open.
-- A list that is too long for one embed field (many dragon balls) continues in a second field, nothing is cut off.
+- The wish screen is laid out like a trade: a header (rewards, requirements, who is wishing), then one separate part
+  for the activation countryball, one for each extra required countryball, and one for the dragon balls, then the
+  buttons and a note telling when the wish cancels itself. A part is red while nothing is added, gold while it is
+  incomplete and green once complete. A wish supports at most 4 extra required countryballs.
+- Lists are shown in full. If a wish is so large that the message would go over Discord's 4000 characters of text,
+  the longest list is shortened with an "...and N more" line.
 - `/wish remove` only suggests the countryballs that were added to the wish.
 - Rewards show the ID and bonuses of what was given, like `(#1A2B, +5ATK%/-3HP%)`.
 - The completion command shows how many of each countryball the player has.
