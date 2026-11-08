@@ -43,6 +43,7 @@ Staff members need the `dragonwish` permissions to see the new sections in the a
 - Chances of specials are overall percentages, tried in order, and cannot add up to more than 100.
 - The wish screen has Wish, Cancel and Clear buttons. Cancel and Clear ask for confirmation first. Clear releases
   everything that was added but keeps the wish open.
+- A list that is too long for one embed field (many dragon balls) continues in a second field, nothing is cut off.
 - `/wish remove` only suggests the countryballs that were added to the wish.
 - Rewards show the ID and bonuses of what was given, like `(#1A2B, +5ATK%/-3HP%)`.
 - The completion command shows how many of each countryball the player has.
