@@ -56,7 +56,7 @@ Staff members need the `dragonwish` permissions to see the new sections in the a
 - Command names (`/wish`, `/wish craft relics`...) cannot be renamed from the admin panel, only the words in messages.
   Two exceptions: the completion command is `/wish <balls command name> completion`, using the name of your balls
   command, and the `/wish start` parameter is named after your dragon word. Changes to these apply after restarting
-  the bot and running `b.reloadtree`.
+  the bot, which syncs its slash commands at startup (run `b.reloadtree` only if startup syncing is skipped).
 - Newly added wishes and relics can take up to 30 seconds to show up in the command autocompletion.
 - Wishes in progress only live in memory. Restarting the bot loses them, and the locked countryballs unlock by
   themselves after 30 minutes. Reloading the package unlocks them right away.
