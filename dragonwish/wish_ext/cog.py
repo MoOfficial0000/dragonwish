@@ -759,11 +759,12 @@ class Wish(commands.GroupCog):
         if session.message_id is None:
             return False
         try:
-            channel = session.interaction.channel
-            await channel.get_partial_message(session.message_id).edit(**kwargs)  # type: ignore
+            # built from the channel id, so that it does not depend on the channel being cached
+            channel = session.interaction.client.get_partial_messageable(session.interaction.channel_id)
+            await channel.get_partial_message(session.message_id).edit(**kwargs)
             return True
-        except discord.HTTPException, AttributeError:
-            log.warning("Could not edit the wish message", exc_info=True)
+        except discord.HTTPException:
+            log.warning("Could not edit the wish message with the bot's token", exc_info=True)
             return False
 
     async def _refresh(self, session: WishSession):
@@ -902,6 +903,8 @@ class Wish(commands.GroupCog):
         if not await self._confirm(
             interaction, "Are you sure you want to cancel this wish? Everything you added is released."
         ):
+            # the wish goes on, show its new deadline
+            await self._refresh(session)
             return
         # the wish may have ended while waiting for the answer
         if self.sessions.get(interaction.user.id) is not session:
@@ -920,11 +923,13 @@ class Wish(commands.GroupCog):
         self._arm_timer(session)
         if not session.all_instances:
             await interaction.response.send_message("There is nothing to clear in your wish.", ephemeral=True)
+            await self._refresh(session)
             return
         if not await self._confirm(
             interaction,
             "Are you sure you want to remove everything from your wish? It stays open, and what you added is released.",
         ):
+            await self._refresh(session)
             return
         if self.sessions.get(interaction.user.id) is not session:
             await interaction.followup.send("This wish is already over.", ephemeral=True)
@@ -961,6 +966,7 @@ class Wish(commands.GroupCog):
         if not session.complete:
             self._arm_timer(session)
             await interaction.followup.send("Insufficient Materials!", ephemeral=True)
+            await self._refresh(session)
             return
 
         # take the wish out right away, so that a double click cannot grant the rewards twice
